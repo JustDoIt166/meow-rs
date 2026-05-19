@@ -344,8 +344,8 @@ mod tests {
             ..Default::default()
         };
 
-        let res = tokio::time::timeout(Duration::from_millis(750), adapter.dial_tcp(&metadata))
-            .await;
+        let res =
+            tokio::time::timeout(Duration::from_millis(750), adapter.dial_tcp(&metadata)).await;
         assert!(
             res.is_err(),
             "expected outer guard to fire; the unbounded dial finished too quickly",
