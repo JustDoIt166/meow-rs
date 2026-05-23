@@ -31,11 +31,17 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smol_str = { workspace = true }
+# Used by `host_resolver_hook` on Android. The module is
+# `#[cfg(target_os = "android")]` so this dep is dead weight on
+# iOS/desktop, but moving it under `target.'cfg(target_os = "android")'`
+# would hide it from `cargo check` on a host build and re-create the
+# class of "compiles on macOS host, fails on the Android target" bug
+# we just fixed. Cost is negligible (one proc-macro crate, build-time only).
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 sysinfo = "0.32"
-async-trait = { workspace = true }
 hickory-proto = { workspace = true }
 
 [lints]
