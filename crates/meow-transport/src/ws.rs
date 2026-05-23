@@ -492,6 +492,15 @@ impl AsyncWrite for WsStream {
                     {
                         return Poll::Ready(Err(io::Error::other(e)));
                     }
+                    // Drive the queued frame onto the wire. tokio-tungstenite's
+                    // Sink buffers messages internally — without an explicit
+                    // poll_flush here, a lone write (SS sends one address+payload
+                    // packet then awaits a read) sits in the sink forever and
+                    // both sides deadlock.
+                    match Pin::new(&mut state.ws).poll_flush(cx) {
+                        Poll::Ready(Ok(())) | Poll::Pending => {}
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
+                    }
                     return Poll::Ready(Ok(buf.len()));
                 }
             }
