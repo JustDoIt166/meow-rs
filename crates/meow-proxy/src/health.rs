@@ -1,4 +1,5 @@
 use meow_common::ProxyAdapter;
+use smol_str::SmolStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -83,7 +84,7 @@ async fn probe_once(
 
     if parsed.https {
         let connector = tls_connector();
-        let server_name = rustls::pki_types::ServerName::try_from(parsed.host.clone())
+        let server_name = rustls::pki_types::ServerName::try_from(parsed.host.to_string())
             .map_err(|e| format!("tls sni: {e}"))?;
         let tls = connector
             .connect(server_name, conn)
@@ -105,25 +106,35 @@ where
 {
     // Host header includes the non-default port so virtual-hosted origins
     // route correctly; mirrors Go net/http's default behaviour.
+    use std::io::Write as _;
+    let mut buf = [0u8; 512];
     let default_port = if parsed.https { 443 } else { 80 };
-    let host_header = if parsed.port == default_port {
-        parsed.host.clone()
+    let mut cursor: &mut [u8] = &mut buf;
+    if parsed.port == default_port {
+        write!(
+            cursor,
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\n\
+             User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            path = parsed.path,
+            host = parsed.host,
+            ver = env!("CARGO_PKG_VERSION"),
+        )
     } else {
-        format!("{}:{}", parsed.host, parsed.port)
-    };
-    let request = format!(
-        "GET {path} HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         User-Agent: clash.meta/{version}\r\n\
-         Accept: */*\r\n\
-         Connection: close\r\n\
-         \r\n",
-        path = parsed.path,
-        host = host_header,
-        version = env!("CARGO_PKG_VERSION"),
-    );
+        write!(
+            cursor,
+            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\
+             User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            path = parsed.path,
+            host = parsed.host,
+            port = parsed.port,
+            ver = env!("CARGO_PKG_VERSION"),
+        )
+    }
+    .map_err(|_| "request too large for buffer".to_string())?;
+    let remaining = cursor.len();
+    let written = buf.len() - remaining;
     stream
-        .write_all(request.as_bytes())
+        .write_all(&buf[..written])
         .await
         .map_err(|e| format!("write: {e}"))?;
     stream.flush().await.map_err(|e| format!("flush: {e}"))?;
@@ -203,9 +214,9 @@ fn tls_connector() -> tokio_rustls::TlsConnector {
 #[derive(Debug, Clone)]
 struct ParsedUrl {
     https: bool,
-    host: String,
+    host: SmolStr,
     port: u16,
-    path: String,
+    path: SmolStr,
 }
 
 impl ParsedUrl {
@@ -236,17 +247,17 @@ impl ParsedUrl {
             } else {
                 80
             };
-            (host.to_string(), port)
+            (SmolStr::from(host), port)
         } else if let Some((h, p)) = authority.rsplit_once(':') {
-            (h.to_string(), p.parse().ok()?)
+            (SmolStr::from(h), p.parse().ok()?)
         } else {
-            (authority.to_string(), if https { 443 } else { 80 })
+            (SmolStr::from(authority), if https { 443 } else { 80 })
         };
         Some(Self {
             https,
             host,
             port,
-            path: path.to_string(),
+            path: SmolStr::from(path),
         })
     }
 }
