@@ -319,4 +319,194 @@ mod tests {
         assert_eq!(Security::ChaCha20Poly1305.to_nibble(), 0x04);
         assert_eq!(Security::None.to_nibble(), 0x05);
     }
+
+    #[test]
+    fn address_encode_ipv6() {
+        let meta = Metadata {
+            dst_ip: Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        encode_address(&mut buf, &meta).unwrap();
+        assert_eq!(buf[0], ADDR_IPV6);
+        assert_eq!(buf.len(), 1 + 16);
+    }
+
+    #[test]
+    fn address_encode_domain_max_255_ok() {
+        let domain = "a".repeat(255);
+        let meta = Metadata {
+            host: domain.into(),
+            dst_port: 80,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        encode_address(&mut buf, &meta).unwrap();
+        assert_eq!(buf[0], ADDR_DOMAIN);
+        assert_eq!(buf[1], 255);
+        assert_eq!(buf.len(), 2 + 255);
+    }
+
+    #[test]
+    fn address_encode_no_destination_errors() {
+        let meta = Metadata {
+            dst_port: 80,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        assert!(encode_address(&mut buf, &meta).is_err());
+    }
+
+    #[test]
+    fn address_encode_domain_idn_not_punycoded() {
+        // upstream: passes raw UTF-8, no punycode conversion
+        let meta = Metadata {
+            host: "例え.jp".into(),
+            dst_port: 80,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        encode_address(&mut buf, &meta).unwrap();
+        assert_eq!(buf[0], ADDR_DOMAIN);
+        assert_eq!(&buf[2..], "例え.jp".as_bytes());
+    }
+
+    #[test]
+    fn address_domain_prefers_host_over_ip() {
+        let meta = Metadata {
+            host: "example.com".into(),
+            dst_ip: Some(IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        encode_address(&mut buf, &meta).unwrap();
+        assert_eq!(buf[0], ADDR_DOMAIN, "domain must take priority over IP");
+    }
+
+    #[test]
+    fn seal_request_header_produces_valid_structure() {
+        let uuid: [u8; 16] = [
+            0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3,
+            0x08, 0x11,
+        ];
+        let ck = cmd_key(&uuid);
+        let meta = Metadata {
+            host: "example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let sealed = seal_request_header(&ck, Security::Aes128Gcm, &meta, false).unwrap();
+
+        // auth_id(16) + conn_nonce(8) + encrypted_length(2+16=18) + encrypted_header(N+16)
+        assert!(sealed.bytes.len() >= 16 + 8 + 18 + 16, "header too short");
+        assert_ne!(sealed.req_key, [0u8; 16], "req_key must be random");
+        assert_ne!(sealed.req_iv, [0u8; 16], "req_iv must be random");
+    }
+
+    #[test]
+    fn seal_request_header_unique_per_call() {
+        let uuid: [u8; 16] = [0x01; 16];
+        let ck = cmd_key(&uuid);
+        let meta = Metadata {
+            host: "test.com".into(),
+            dst_port: 80,
+            ..Default::default()
+        };
+        let h1 = seal_request_header(&ck, Security::Aes128Gcm, &meta, false).unwrap();
+        let h2 = seal_request_header(&ck, Security::Aes128Gcm, &meta, false).unwrap();
+        assert_ne!(h1.bytes, h2.bytes, "each header must use fresh randomness");
+        assert_ne!(h1.req_key, h2.req_key);
+    }
+
+    #[test]
+    fn header_plaintext_port_before_addr_type() {
+        let meta = Metadata {
+            host: "example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let mut rng = rand::rng();
+        let req_key = [0u8; 16];
+        let req_iv = [0u8; 16];
+        let pt = build_header_plaintext(
+            &req_key,
+            &req_iv,
+            0x42,
+            Security::Aes128Gcm,
+            &meta,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+        // version(1) + req_iv(16) + req_key(16) + resp_v(1) + opts(1) + p_sec(1) + reserved(1) + cmd(1) = 38
+        // Then port(2) then addr_type(1)
+        let port_offset = 38;
+        let port = u16::from_be_bytes([pt[port_offset], pt[port_offset + 1]]);
+        assert_eq!(port, 443, "port must be at offset 38 (before addr_type)");
+        assert_eq!(
+            pt[port_offset + 2],
+            ADDR_DOMAIN,
+            "addr_type must follow port"
+        );
+    }
+
+    #[test]
+    fn header_plaintext_ends_with_fnv1a() {
+        let meta = Metadata {
+            dst_ip: Some(IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))),
+            dst_port: 80,
+            ..Default::default()
+        };
+        let mut rng = FakeRng(0);
+        let pt = build_header_plaintext(
+            &[0u8; 16],
+            &[0u8; 16],
+            0x42,
+            Security::Aes128Gcm,
+            &meta,
+            false,
+            &mut rng,
+        )
+        .unwrap();
+        let body = &pt[..pt.len() - 4];
+        let expected_hash = fnv1a32(body);
+        let actual_hash = u32::from_be_bytes([
+            pt[pt.len() - 4],
+            pt[pt.len() - 3],
+            pt[pt.len() - 2],
+            pt[pt.len() - 1],
+        ]);
+        assert_eq!(
+            actual_hash, expected_hash,
+            "FNV-1a must cover all preceding bytes"
+        );
+    }
+
+    #[test]
+    fn auto_security_returns_valid_cipher() {
+        let s = super::auto_security();
+        assert!(
+            s == Security::Aes128Gcm || s == Security::ChaCha20Poly1305,
+            "auto must pick aes or chacha"
+        );
+    }
+
+    struct FakeRng(u64);
+    impl rand::RngCore for FakeRng {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self.0.wrapping_add(1);
+            self.0 as u32
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(1);
+            self.0
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for b in dest.iter_mut() {
+                *b = self.next_u32() as u8;
+            }
+        }
+    }
 }

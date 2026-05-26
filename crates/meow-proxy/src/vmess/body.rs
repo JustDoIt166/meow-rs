@@ -199,3 +199,163 @@ impl BodyCipher {
         MAX_PLAINTEXT
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_keys() -> ([u8; 16], [u8; 16]) {
+        let req_key = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
+        let req_iv = [
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+            0x1f, 0x20,
+        ];
+        (req_key, req_iv)
+    }
+
+    #[tokio::test]
+    async fn aes_128_gcm_record_round_trip() {
+        let (req_key, req_iv) = test_keys();
+        let mut writer_cipher = BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, 0x42);
+        let plaintext = b"hello vmess aes-128-gcm body";
+
+        let mut wire = Vec::new();
+        writer_cipher
+            .write_record(&mut wire, plaintext)
+            .await
+            .unwrap();
+
+        // Wire must be: 2-byte length + ciphertext(plaintext_len + 16 tag)
+        let expected_ct_len = plaintext.len() + 16;
+        let wire_len = u16::from_be_bytes([wire[0], wire[1]]) as usize;
+        assert_eq!(
+            wire_len, expected_ct_len,
+            "record length must include the 16-byte tag"
+        );
+        assert_eq!(wire.len(), 2 + expected_ct_len);
+
+        // Now read it back — use WRITE keys since we're decrypting what we wrote
+        // (read_cipher uses response keys derived from swapped req_iv/req_key)
+        // For self-round-trip, we need a cipher with matching keys.
+        let mut read_cipher = BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, 0x42);
+        // Override read keys to match write keys for self-test
+        read_cipher.read_key = read_cipher.write_key.clone();
+        read_cipher.read_iv = read_cipher.write_iv;
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let decrypted = read_cipher.read_record(&mut cursor).await.unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn chacha20_poly1305_record_round_trip() {
+        let (req_key, req_iv) = test_keys();
+        let mut writer_cipher =
+            BodyCipher::new(Security::ChaCha20Poly1305, &req_key, &req_iv, 0x42);
+        let plaintext = b"hello vmess chacha20 body";
+
+        let mut wire = Vec::new();
+        writer_cipher
+            .write_record(&mut wire, plaintext)
+            .await
+            .unwrap();
+
+        let expected_ct_len = plaintext.len() + 16;
+        let wire_len = u16::from_be_bytes([wire[0], wire[1]]) as usize;
+        assert_eq!(wire_len, expected_ct_len);
+
+        let mut read_cipher = BodyCipher::new(Security::ChaCha20Poly1305, &req_key, &req_iv, 0x42);
+        read_cipher.read_key = read_cipher.write_key.clone();
+        read_cipher.read_iv = read_cipher.write_iv;
+
+        let mut cursor = std::io::Cursor::new(wire);
+        let decrypted = read_cipher.read_record(&mut cursor).await.unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn none_is_passthrough() {
+        let (req_key, req_iv) = test_keys();
+        let mut cipher = BodyCipher::new(Security::None, &req_key, &req_iv, 0x42);
+        let plaintext = b"raw bytes no framing";
+
+        let mut wire = Vec::new();
+        cipher.write_record(&mut wire, plaintext).await.unwrap();
+        assert_eq!(wire, plaintext, "security:none must not add framing");
+    }
+
+    #[tokio::test]
+    async fn nonce_counter_increments_per_record() {
+        let (req_key, req_iv) = test_keys();
+        let mut cipher = BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, 0x42);
+        let data = b"x";
+
+        let mut wire1 = Vec::new();
+        cipher.write_record(&mut wire1, data).await.unwrap();
+        let mut wire2 = Vec::new();
+        cipher.write_record(&mut wire2, data).await.unwrap();
+        let mut wire3 = Vec::new();
+        cipher.write_record(&mut wire3, data).await.unwrap();
+
+        // Same plaintext with different nonces must produce different ciphertext
+        assert_ne!(wire1, wire2);
+        assert_ne!(wire2, wire3);
+        assert_ne!(wire1, wire3);
+    }
+
+    #[test]
+    fn chacha_key_uses_md5_cascade_not_kdf() {
+        let (req_key, req_iv) = test_keys();
+        let cipher = BodyCipher::new(Security::ChaCha20Poly1305, &req_key, &req_iv, 0x42);
+        // ChaCha20 body_key = MD5(req_key) || MD5(MD5(req_key)) — 32 bytes
+        assert_eq!(
+            cipher.write_key.len(),
+            32,
+            "chacha key must be 32 bytes (double MD5)"
+        );
+
+        let mut hasher = Md5::new();
+        hasher.update(req_key);
+        let md5_1: [u8; 16] = hasher.finalize().into();
+        let mut hasher2 = Md5::new();
+        hasher2.update(md5_1);
+        let md5_2: [u8; 16] = hasher2.finalize().into();
+
+        assert_eq!(&cipher.write_key[..16], &md5_1);
+        assert_eq!(&cipher.write_key[16..], &md5_2);
+    }
+
+    #[test]
+    fn aes_key_uses_kdf_not_md5() {
+        let (req_key, req_iv) = test_keys();
+        let cipher = BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, 0x42);
+        assert_eq!(cipher.write_key.len(), 16, "aes key must be 16 bytes (KDF)");
+        // Verify it matches the KDF derivation
+        let mut key_iv = [0u8; 32];
+        key_iv[..16].copy_from_slice(&req_key);
+        key_iv[16..].copy_from_slice(&req_iv);
+        let expected = kdf16(&key_iv, &[b"VMess Body AEAD Key"]);
+        assert_eq!(cipher.write_key.as_slice(), &expected);
+    }
+
+    #[tokio::test]
+    async fn record_length_includes_tag() {
+        let (req_key, req_iv) = test_keys();
+        let mut cipher = BodyCipher::new(Security::Aes128Gcm, &req_key, &req_iv, 0x42);
+        let plaintext = vec![0xAB; 100];
+
+        let mut wire = Vec::new();
+        cipher.write_record(&mut wire, &plaintext).await.unwrap();
+
+        let wire_len = u16::from_be_bytes([wire[0], wire[1]]) as usize;
+        // upstream: len = plaintext_len + 16 (tag), NOT just plaintext_len
+        assert_eq!(
+            wire_len,
+            100 + 16,
+            "record length must be plaintext + 16 (tag)"
+        );
+    }
+}
