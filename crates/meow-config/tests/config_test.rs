@@ -279,14 +279,67 @@ proxies:
 async fn test_unsupported_proxy_type_skipped() {
     let yaml = r#"
 proxies:
-  - name: "vmess-server"
-    type: vmess
+  - name: "wireguard-server"
+    type: wireguard
     server: "1.2.3.4"
     port: 443
 "#;
     let config = load_config_from_str(yaml).await.unwrap();
-    // vmess is not yet supported, so it should be skipped
-    assert!(!config.proxies.contains_key("vmess-server"));
+    assert!(!config.proxies.contains_key("wireguard-server"));
+}
+
+#[tokio::test]
+async fn test_vmess_minimal_config() {
+    let yaml = r#"
+proxies:
+  - name: "vmess-test"
+    type: vmess
+    server: "1.2.3.4"
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    cipher: auto
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(config.proxies.contains_key("vmess-test"));
+}
+
+#[tokio::test]
+async fn test_vmess_cipher_zero_hard_errors() {
+    let yaml = r#"
+proxies:
+  - name: "vmess-zero"
+    type: vmess
+    server: "1.2.3.4"
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    cipher: zero
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(
+        !config.proxies.contains_key("vmess-zero"),
+        "cipher:zero must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_vmess_with_ws_transport() {
+    let yaml = r#"
+proxies:
+  - name: "vmess-ws"
+    type: vmess
+    server: "example.com"
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    cipher: aes-128-gcm
+    tls: true
+    network: ws
+    ws-opts:
+      path: /vmess
+      headers:
+        Host: example.com
+"#;
+    let config = load_config_from_str(yaml).await.unwrap();
+    assert!(config.proxies.contains_key("vmess-ws"));
 }
 
 #[tokio::test]
