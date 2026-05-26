@@ -141,9 +141,8 @@ async fn read_status_line<S>(stream: &mut S) -> Result<u16, String>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    // The status line is at most a few dozen bytes; cap reads so a hostile
-    // peer can't stream megabytes of header into us.
-    let mut buf = Vec::with_capacity(256);
+    let mut buf = [0u8; 1024];
+    let mut len = 0usize;
     let mut byte = [0u8; 1];
     loop {
         let n = stream
@@ -153,12 +152,15 @@ where
         if n == 0 {
             return Err("eof before status line".into());
         }
-        buf.push(byte[0]);
-        if buf.ends_with(b"\r\n") || buf.len() >= 1024 {
+        if len < buf.len() {
+            buf[len] = byte[0];
+            len += 1;
+        }
+        if buf[..len].ends_with(b"\r\n") || len >= buf.len() {
             break;
         }
     }
-    let line = std::str::from_utf8(&buf).map_err(|_| "status line not utf-8".to_string())?;
+    let line = std::str::from_utf8(&buf[..len]).map_err(|_| "status line not utf-8".to_string())?;
     // HTTP/1.x status line: "HTTP/1.1 204 No Content\r\n"
     let mut parts = line.split_whitespace();
     let version = parts.next().unwrap_or("");

@@ -60,8 +60,9 @@ async fn handle_socks5_inner(
         return Err("invalid SOCKS version".into());
     }
     let nmethods = header[1] as usize;
-    let mut methods = vec![0u8; nmethods];
-    stream.read_exact(&mut methods).await?;
+    let mut methods_buf = [0u8; 255];
+    stream.read_exact(&mut methods_buf[..nmethods]).await?;
+    let methods = &methods_buf[..nmethods];
 
     let needs_auth = auth.is_some_and(|a| !a.credentials.is_empty())
         && !auth.is_some_and(|a| a.should_skip(&src_addr.ip()));
@@ -84,15 +85,17 @@ async fn handle_socks5_inner(
         }
         let mut ulen = [0u8; 1];
         stream.read_exact(&mut ulen).await?;
-        let mut username_buf = vec![0u8; ulen[0] as usize];
-        stream.read_exact(&mut username_buf).await?;
+        let mut auth_buf = [0u8; 255];
+        stream.read_exact(&mut auth_buf[..ulen[0] as usize]).await?;
+        let username = std::str::from_utf8(&auth_buf[..ulen[0] as usize])
+            .unwrap_or_default()
+            .to_string();
         let mut plen = [0u8; 1];
         stream.read_exact(&mut plen).await?;
-        let mut password_buf = vec![0u8; plen[0] as usize];
-        stream.read_exact(&mut password_buf).await?;
-
-        let username = String::from_utf8_lossy(&username_buf).to_string();
-        let password = String::from_utf8_lossy(&password_buf).to_string();
+        stream.read_exact(&mut auth_buf[..plen[0] as usize]).await?;
+        let password = std::str::from_utf8(&auth_buf[..plen[0] as usize])
+            .unwrap_or_default()
+            .to_string();
 
         if !auth.credentials.verify(&username, &password) {
             stream.write_all(&[0x01, 0x01]).await?;
@@ -227,11 +230,14 @@ async fn parse_socks5_address(
         ATYP_DOMAIN => {
             let mut len = [0u8; 1];
             stream.read_exact(&mut len).await?;
-            let mut domain = vec![0u8; len[0] as usize];
-            stream.read_exact(&mut domain).await?;
+            let dlen = len[0] as usize;
+            let mut domain_buf = [0u8; 255];
+            stream.read_exact(&mut domain_buf[..dlen]).await?;
             let mut port_buf = [0u8; 2];
             stream.read_exact(&mut port_buf).await?;
-            let host = String::from_utf8_lossy(&domain).to_string();
+            let host = std::str::from_utf8(&domain_buf[..dlen])
+                .unwrap_or_default()
+                .to_string();
             let port = u16::from_be_bytes(port_buf);
             Ok((host, None, port))
         }

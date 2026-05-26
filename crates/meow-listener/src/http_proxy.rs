@@ -136,7 +136,7 @@ async fn handle_http_inner(
             conn_type: ConnType::Https,
             src_ip: Some(src_addr.ip()),
             src_port: src_addr.port(),
-            host: host.as_str().into(),
+            host: host.into(),
             dst_port: port,
             in_name: in_name.into(),
             in_port,
@@ -217,7 +217,7 @@ async fn handle_http_inner(
             conn_type: ConnType::Http,
             src_ip: Some(src_addr.ip()),
             src_port: src_addr.port(),
-            host: host.as_str().into(),
+            host: host.into(),
             dst_port: port,
             in_name: in_name.into(),
             in_port,
@@ -328,18 +328,17 @@ fn find_crlf_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn parse_host_port(target: &str, default_port: u16) -> (String, u16) {
-    // target is like "host:port" or just "host"
+fn parse_host_port(target: &str, default_port: u16) -> (&str, u16) {
     if let Some((host, port_str)) = target.rsplit_once(':') {
         if let Ok(port) = port_str.parse::<u16>() {
-            return (host.to_string(), port);
+            return (host, port);
         }
     }
-    (target.to_string(), default_port)
+    (target, default_port)
 }
 
 /// Parse host and port from an absolute HTTP URL like "http://ipinfo.io/json"
-fn parse_url_host_port(url: &str) -> (String, u16) {
+fn parse_url_host_port(url: &str) -> (&str, u16) {
     // Strip scheme
     let without_scheme = url
         .strip_prefix("http://")
