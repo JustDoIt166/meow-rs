@@ -5,14 +5,15 @@ use meow_common::{
     ProxyHealth, ProxyPacketConn, Result,
 };
 use parking_lot::RwLock;
+use smol_str::SmolStr;
 use std::sync::Arc;
 
 pub struct SelectorGroup {
-    name: String,
+    name: SmolStr,
     static_proxies: Vec<Arc<dyn Proxy>>,
     provider_slots: Vec<ProviderSlot>,
     /// Name of the currently selected proxy; `None` means use the first.
-    selected: RwLock<Option<String>>,
+    selected: RwLock<Option<SmolStr>>,
     /// Optional write-through persistence; primed at construction.
     store: Option<Arc<SelectorStore>>,
     health: ProxyHealth,
@@ -21,7 +22,7 @@ pub struct SelectorGroup {
 impl SelectorGroup {
     pub fn new(name: &str, proxies: Vec<Arc<dyn Proxy>>) -> Self {
         Self {
-            name: name.to_string(),
+            name: SmolStr::from(name),
             static_proxies: proxies,
             provider_slots: Vec::new(),
             selected: RwLock::new(None),
@@ -36,7 +37,7 @@ impl SelectorGroup {
         slots: Vec<ProviderSlot>,
     ) -> Self {
         Self {
-            name: name.to_string(),
+            name: SmolStr::from(name),
             static_proxies: proxies,
             provider_slots: slots,
             selected: RwLock::new(None),
@@ -51,7 +52,7 @@ impl SelectorGroup {
     #[must_use]
     pub fn with_store(mut self, store: Arc<SelectorStore>) -> Self {
         if let Some(prev) = store.get(&self.name) {
-            *self.selected.write() = Some(prev);
+            *self.selected.write() = Some(SmolStr::from(prev));
         }
         self.store = Some(store);
         self
@@ -74,7 +75,7 @@ impl SelectorGroup {
     /// Selection survives provider refreshes because it is stored by name.
     pub fn select(&self, name: &str) -> bool {
         if self.contains_name(name) {
-            *self.selected.write() = Some(name.to_string());
+            *self.selected.write() = Some(SmolStr::from(name));
             if let Some(store) = &self.store {
                 store.set(&self.name, name);
             }
@@ -88,7 +89,7 @@ impl SelectorGroup {
     /// `Vec`. Walks `static_proxies` then provider slots; falls back to the
     /// first proxy if `selected` is unset or names something no longer present.
     pub fn selected_proxy(&self) -> Option<Arc<dyn Proxy>> {
-        let sel = self.selected.read().clone();
+        let sel: Option<SmolStr> = self.selected.read().clone();
         let mut first_any: Option<Arc<dyn Proxy>> = None;
         if let Some(name) = sel {
             for p in &self.static_proxies {
@@ -214,7 +215,7 @@ impl Proxy for SelectorGroup {
     }
 
     fn current(&self) -> Option<String> {
-        self.selected_proxy().map(|p| p.name().to_string())
+        self.selected_proxy().map(|p| p.name().into())
     }
 }
 

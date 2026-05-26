@@ -4,24 +4,25 @@ use meow_common::{
     ProxyHealth, ProxyPacketConn, Result,
 };
 use parking_lot::RwLock;
+use smol_str::SmolStr;
 use std::sync::Arc;
 
 pub struct UrlTestGroup {
-    name: String,
+    name: SmolStr,
     static_proxies: Vec<Arc<dyn Proxy>>,
     provider_slots: Vec<ProviderSlot>,
     tolerance: u16,
     /// Name of the currently selected proxy; `None` means "not yet picked,
     /// use the first available".  Updated by `pick_for_dial` whenever it
     /// promotes a new best.
-    fastest: RwLock<Option<String>>,
+    fastest: RwLock<Option<SmolStr>>,
     health: ProxyHealth,
 }
 
 impl UrlTestGroup {
     pub fn new(name: &str, proxies: Vec<Arc<dyn Proxy>>, tolerance: u16) -> Self {
         Self {
-            name: name.to_string(),
+            name: SmolStr::from(name),
             static_proxies: proxies,
             provider_slots: Vec::new(),
             tolerance,
@@ -37,7 +38,7 @@ impl UrlTestGroup {
         slots: Vec<ProviderSlot>,
     ) -> Self {
         Self {
-            name: name.to_string(),
+            name: SmolStr::from(name),
             static_proxies: proxies,
             provider_slots: slots,
             tolerance,
@@ -56,7 +57,7 @@ impl UrlTestGroup {
     /// scanned again to read the current proxy's delay/aliveness; then
     /// `fastest_proxy` cloned the Vec a second time to look up by name.
     fn pick_for_dial(&self) -> Option<Arc<dyn Proxy>> {
-        let current_name: Option<String> = self.fastest.read().clone();
+        let current_name: Option<SmolStr> = self.fastest.read().clone();
 
         let mut best_proxy: Option<Arc<dyn Proxy>> = None;
         let mut best_delay: u16 = u16::MAX;
@@ -102,12 +103,12 @@ impl UrlTestGroup {
 
         if let Some(bp) = best_proxy.as_ref() {
             if best_delay.saturating_add(self.tolerance) < current_delay || !current_alive {
-                *self.fastest.write() = Some(bp.name().to_string());
+                *self.fastest.write() = Some(SmolStr::from(bp.name()));
                 return Some(Arc::clone(bp));
             }
         } else if !current_alive {
             let fb = first_any.clone();
-            *self.fastest.write() = fb.as_ref().map(|p| p.name().to_string());
+            *self.fastest.write() = fb.as_ref().map(|p| SmolStr::from(p.name()));
             return fb;
         }
         current_proxy.or(best_proxy).or(first_any)
@@ -240,7 +241,7 @@ impl Proxy for UrlTestGroup {
     }
 
     fn current(&self) -> Option<String> {
-        self.fastest_proxy().map(|p| p.name().to_string())
+        self.fastest_proxy().map(|p| p.name().into())
     }
 }
 

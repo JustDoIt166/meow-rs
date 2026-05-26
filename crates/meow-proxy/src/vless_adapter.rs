@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
+use smol_str::SmolStr;
 use tracing::debug;
 
 use crate::stream_conn::StreamConn;
@@ -43,10 +44,10 @@ pub enum VlessFlow {
 
 /// VLESS outbound proxy adapter.
 pub struct VlessAdapter {
-    name: String,
-    server: String,
+    name: SmolStr,
+    server: SmolStr,
     port: u16,
-    addr_str: String,
+    addr_str: SmolStr,
     uuid_bytes: [u8; 16],
     flow: Option<VlessFlow>,
     udp: bool,
@@ -70,10 +71,10 @@ impl VlessAdapter {
         transport: TransportChain,
     ) -> Self {
         Self {
-            name: name.to_string(),
-            server: server.to_string(),
+            name: SmolStr::from(name),
+            server: SmolStr::from(server),
             port,
-            addr_str: format!("{server}:{port}"),
+            addr_str: SmolStr::from(format!("{server}:{port}")),
             uuid_bytes,
             flow,
             udp,

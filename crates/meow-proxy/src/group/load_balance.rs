@@ -3,6 +3,7 @@ use meow_common::{
     AdapterType, DelayHistory, MeowError, Metadata, Proxy, ProxyAdapter, ProxyConn, ProxyHealth,
     ProxyPacketConn, Result,
 };
+use smol_str::SmolStr;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -14,7 +15,7 @@ pub enum LbStrategy {
 }
 
 pub struct LoadBalanceGroup {
-    name: String,
+    name: SmolStr,
     proxies: Vec<Arc<dyn Proxy>>,
     strategy: LbStrategy,
     counter: AtomicUsize,
@@ -24,7 +25,7 @@ pub struct LoadBalanceGroup {
 impl LoadBalanceGroup {
     pub fn new(name: &str, proxies: Vec<Arc<dyn Proxy>>, strategy: LbStrategy) -> Self {
         Self {
-            name: name.to_string(),
+            name: SmolStr::from(name),
             proxies,
             strategy,
             counter: AtomicUsize::new(0),

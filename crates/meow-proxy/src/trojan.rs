@@ -18,6 +18,7 @@ use meow_transport::{
     Stream as TransportStream, Transport,
 };
 use sha2::{Digest, Sha224};
+use smol_str::SmolStr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
@@ -36,11 +37,11 @@ const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 
 pub struct TrojanAdapter {
-    name: String,
-    server: String,
+    name: SmolStr,
+    server: SmolStr,
     port: u16,
-    addr_str: String,
-    hex_password: String,
+    addr_str: SmolStr,
+    hex_password: SmolStr,
     support_udp: bool,
     health: ProxyHealth,
     tls_layer: TlsLayer,
@@ -77,11 +78,11 @@ impl TrojanAdapter {
             .expect("TrojanAdapter: failed to build TlsLayer — check SNI/cert config");
 
         Self {
-            name: name.to_string(),
-            server: server.to_string(),
+            name: SmolStr::from(name),
+            server: SmolStr::from(server),
             port,
-            addr_str: format!("{server}:{port}"),
-            hex_password,
+            addr_str: SmolStr::from(format!("{server}:{port}")),
+            hex_password: SmolStr::from(hex_password),
             support_udp: udp,
             health: ProxyHealth::new(),
             tls_layer,

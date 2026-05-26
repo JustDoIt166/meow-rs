@@ -22,6 +22,7 @@ use meow_common::{
     AdapterType, MeowError, Metadata, Proxy, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn,
     Result,
 };
+use smol_str::SmolStr;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -152,7 +153,7 @@ async fn relay_udp(
 ///
 /// upstream: adapter/outbound/relay.go — `Relay`
 pub struct RelayGroup {
-    name: String,
+    name: SmolStr,
     proxies: Vec<Arc<dyn Proxy>>,
     health: ProxyHealth, // for API surface; relay has no self-health-check
 }
@@ -169,7 +170,7 @@ impl RelayGroup {
             proxies.len()
         );
         Self {
-            name: name.to_string(),
+            name: SmolStr::from(name),
             proxies,
             health: ProxyHealth::new(),
         }

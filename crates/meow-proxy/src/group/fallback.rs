@@ -3,10 +3,11 @@ use meow_common::{
     AdapterType, DelayHistory, MeowError, Metadata, ProviderSlot, Proxy, ProxyAdapter, ProxyConn,
     ProxyHealth, ProxyPacketConn, Result,
 };
+use smol_str::SmolStr;
 use std::sync::Arc;
 
 pub struct FallbackGroup {
-    name: String,
+    name: SmolStr,
     static_proxies: Vec<Arc<dyn Proxy>>,
     provider_slots: Vec<ProviderSlot>,
     health: ProxyHealth,
@@ -15,7 +16,7 @@ pub struct FallbackGroup {
 impl FallbackGroup {
     pub fn new(name: &str, proxies: Vec<Arc<dyn Proxy>>) -> Self {
         Self {
-            name: name.to_string(),
+            name: SmolStr::from(name),
             static_proxies: proxies,
             provider_slots: Vec::new(),
             health: ProxyHealth::new(),
@@ -28,7 +29,7 @@ impl FallbackGroup {
         slots: Vec<ProviderSlot>,
     ) -> Self {
         Self {
-            name: name.to_string(),
+            name: SmolStr::from(name),
             static_proxies: proxies,
             provider_slots: slots,
             health: ProxyHealth::new(),

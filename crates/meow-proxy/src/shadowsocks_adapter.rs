@@ -15,6 +15,7 @@ use shadowsocks::relay::udprelay::proxy_socket::UdpSocketType;
 use shadowsocks::relay::udprelay::{DatagramReceive, DatagramSend, DatagramSocket, ProxySocket};
 use shadowsocks::relay::Address;
 use shadowsocks::ProxyClientStream;
+use smol_str::SmolStr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::debug;
@@ -51,12 +52,12 @@ enum PluginKind {
 }
 
 pub struct ShadowsocksAdapter {
-    name: String,
-    server: String,
+    name: SmolStr,
+    server: SmolStr,
     port: u16,
     server_config: ServerConfig,
     context: shadowsocks::context::SharedContext,
-    addr_str: String,
+    addr_str: SmolStr,
     support_udp: bool,
     plugin: PluginKind,
     health: ProxyHealth,
@@ -80,7 +81,7 @@ impl ShadowsocksAdapter {
         let mut server_config = ServerConfig::new((server, port), password, cipher_kind)
             .map_err(|e| MeowError::Config(format!("invalid ss config: {e}")))?;
         let context = Context::new_shared(ServerType::Local);
-        let addr_str = format!("{server}:{port}");
+        let addr_str = SmolStr::from(format!("{server}:{port}"));
 
         let plugin = match plugin_name {
             Some(p) if is_builtin_obfs_plugin(p) => {
@@ -134,8 +135,8 @@ impl ShadowsocksAdapter {
         };
 
         Ok(Self {
-            name: name.to_string(),
-            server: server.to_string(),
+            name: SmolStr::from(name),
+            server: SmolStr::from(server),
             port,
             server_config,
             context,

@@ -25,6 +25,7 @@ use base64::Engine as _;
 use meow_common::{
     AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
 };
+use smol_str::SmolStr;
 use std::fmt;
 use std::fmt::Write as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,11 +39,11 @@ use crate::stream_conn::StreamConn;
 ///
 /// upstream: `adapter/outbound/http.go` — `HttpAdapter`
 pub struct HttpAdapter {
-    name: String,
-    server: String,
+    name: SmolStr,
+    server: SmolStr,
     port: u16,
     /// `"server:port"` — returned by `addr()` for relay metadata building.
-    addr_str: String,
+    addr_str: SmolStr,
     /// `Some((username, password))` — both present or neither (ADR-0002 Class A).
     auth: Option<(String, String)>,
     tls: bool,
@@ -67,9 +68,9 @@ impl HttpAdapter {
         extra_headers: Vec<(String, String)>,
     ) -> Self {
         Self {
-            name: name.to_string(),
-            addr_str: format!("{server}:{port}"),
-            server: server.to_string(),
+            name: SmolStr::from(name),
+            addr_str: SmolStr::from(format!("{server}:{port}")),
+            server: SmolStr::from(server),
             port,
             auth,
             tls,
@@ -91,7 +92,7 @@ impl HttpAdapter {
 
             let tls_cfg = TlsConfig {
                 skip_cert_verify: self.skip_cert_verify,
-                ..TlsConfig::new(&self.server)
+                ..TlsConfig::new(self.server.as_str())
             };
             let tls_layer = TlsLayer::new(&tls_cfg).map_err(|e| MeowError::Proxy(e.to_string()))?;
             tls_layer
