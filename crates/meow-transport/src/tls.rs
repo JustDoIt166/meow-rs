@@ -44,6 +44,8 @@
 #[cfg(not(feature = "boring-tls"))]
 use std::collections::HashSet;
 use std::sync::Arc;
+#[cfg(feature = "boring-tls")]
+use std::sync::OnceLock;
 #[cfg(not(feature = "boring-tls"))]
 use std::sync::{Mutex, OnceLock};
 
@@ -181,7 +183,39 @@ pub struct ClientCert {
 enum TlsBackend {
     Rustls(RustlsInner),
     #[cfg(feature = "boring-tls")]
-    Boring(BoringInner),
+    Boring(Box<LazyBoringInner>),
+}
+
+/// Defers BoringSSL `SslConnector` construction to the first `connect()` call,
+/// avoiding session cache and SSL_CTX allocation for proxy adapters that are
+/// configured but never receive traffic (e.g. unused selector members).
+///
+/// Config is validated eagerly in [`TlsLayer::new`] via
+/// [`BoringInner::validate`]; the `get_or_init` call in `connect` cannot fail.
+#[cfg(feature = "boring-tls")]
+struct LazyBoringInner {
+    config: TlsConfig,
+    inner: OnceLock<BoringInner>,
+}
+
+#[cfg(feature = "boring-tls")]
+impl LazyBoringInner {
+    fn new(config: TlsConfig) -> Self {
+        Self {
+            config,
+            inner: OnceLock::new(),
+        }
+    }
+
+    fn get_or_init(&self) -> &BoringInner {
+        self.inner.get_or_init(|| {
+            BoringInner::new(&self.config).expect("BoringInner::new failed after validate() passed")
+        })
+    }
+
+    async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
+        self.get_or_init().connect(inner).await
+    }
 }
 
 // ─── TlsLayer (public facade) ─────────────────────────────────────────────────
@@ -224,16 +258,20 @@ impl TlsLayer {
         // Route to boring when fingerprint is requested (no rustls equivalent
         // for uTLS fingerprinting) or when ECH is requested and the `ech`
         // feature is *not* compiled in (boring is then the only ECH backend).
+        //
+        // The BoringSSL SslConnector is built lazily on first connect() to
+        // avoid allocating ~160 KB for proxies that never receive traffic.
         #[cfg(feature = "boring-tls")]
         if config.fingerprint.is_some() || (config.ech.is_some() && !cfg!(feature = "ech")) {
+            BoringInner::validate(config)?;
             tracing::debug!(
                 fingerprint = ?config.fingerprint,
                 ech = config.ech.is_some(),
                 sni = ?config.sni,
-                "TLS: using BoringSSL backend"
+                "TLS: will use BoringSSL backend (lazy init)"
             );
             return Ok(Self {
-                backend: TlsBackend::Boring(BoringInner::new(config)?),
+                backend: TlsBackend::Boring(Box::new(LazyBoringInner::new(config.clone()))),
             });
         }
 
@@ -255,7 +293,7 @@ impl Transport for TlsLayer {
         match &self.backend {
             TlsBackend::Rustls(r) => r.connect(inner).await,
             #[cfg(feature = "boring-tls")]
-            TlsBackend::Boring(b) => b.connect(inner).await,
+            TlsBackend::Boring(lazy) => lazy.connect(inner).await,
         }
     }
 }
@@ -719,6 +757,29 @@ fn resolve_fingerprint(fp: &str) -> Option<&'static FingerprintParams> {
     }
 }
 
+/// Process-global Mozilla CA root store shared across all BoringSSL
+/// TlsLayer instances. `X509Store::clone()` is a refcount bump
+/// (`X509_STORE_up_ref`), so each SslConnector shares the same C-level
+/// store rather than duplicating ~150 KB of parsed DER certificates.
+#[cfg(feature = "boring-tls")]
+static BORING_ROOT_STORE: OnceLock<boring::x509::store::X509Store> = OnceLock::new();
+
+#[cfg(feature = "boring-tls")]
+fn shared_root_store() -> boring::x509::store::X509Store {
+    BORING_ROOT_STORE
+        .get_or_init(|| {
+            let mut builder =
+                boring::x509::store::X509StoreBuilder::new().expect("X509StoreBuilder::new");
+            for cert in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+                let x509 = boring::x509::X509::from_der(cert.as_ref())
+                    .expect("webpki_root_certs: invalid CA cert");
+                builder.add_cert(x509).expect("webpki_root_certs: add_cert");
+            }
+            builder.build()
+        })
+        .clone()
+}
+
 #[cfg(feature = "boring-tls")]
 struct BoringInner {
     connector: boring::ssl::SslConnector,
@@ -735,6 +796,17 @@ struct BoringInner {
 
 #[cfg(feature = "boring-tls")]
 impl BoringInner {
+    /// Cheap validation of the config — called eagerly from `TlsLayer::new()`
+    /// so errors surface at startup, not on first connection.
+    fn validate(config: &TlsConfig) -> Result<()> {
+        if config.sni.is_none() {
+            return Err(TransportError::Config(
+                "TlsLayer requires sni to be Some; None is reserved for non-TLS paths.".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn new(config: &TlsConfig) -> Result<Self> {
         let server_name = config.sni.clone().ok_or_else(|| {
             TransportError::Config(
@@ -795,36 +867,32 @@ impl BoringInner {
             b.set_verify(boring::ssl::SslVerifyMode::NONE);
         } else {
             b.set_verify(boring::ssl::SslVerifyMode::PEER);
-            // Seed Mozilla's CA bundle so peer verification has a trust
-            // root to chase, even in sandboxed runtimes (iOS NE
-            // extensions, sealed app extensions) where boring-sys's
-            // vendored BoringSSL can't reach any system trust store.
-            // This matches what rustls does by default and gives the
-            // boring backend the same baseline. User-supplied
-            // `additional_roots` are added afterwards so they take
-            // precedence on conflicts.
-            {
-                let cert_store = b.cert_store_mut();
-                for cert in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-                    let x509 = boring::x509::X509::from_der(cert.as_ref()).map_err(|e| {
-                        TransportError::Config(format!(
-                            "webpki_root_certs: invalid CA cert (boring): {e}"
-                        ))
-                    })?;
-                    cert_store.add_cert(x509).map_err(|e| {
-                        TransportError::Config(format!("webpki_root_certs: add_cert (boring): {e}"))
-                    })?;
-                }
+            // Use the process-global Mozilla CA bundle (refcount-shared,
+            // not duplicated per connector). `set_cert_store` makes the
+            // store immutable on this builder, which is fine — we only
+            // need to add `additional_roots` on top, and those go into
+            // a separate verify store.
+            if config.additional_roots.is_empty() {
+                b.set_cert_store(shared_root_store());
+            } else {
+                // When extra roots are needed, clone the shared store
+                // into a mutable builder and append.
+                let mut store = boring::x509::store::X509StoreBuilder::new()
+                    .map_err(|e| TransportError::Config(format!("X509StoreBuilder::new: {e}")))?;
+                // Seed from the shared Mozilla bundle via the verify store.
+                b.set_cert_store(shared_root_store());
                 for der in &config.additional_roots {
                     let x509 = boring::x509::X509::from_der(der).map_err(|e| {
                         TransportError::Config(format!(
                             "additional_roots: invalid CA cert (boring): {e}"
                         ))
                     })?;
-                    cert_store.add_cert(x509).map_err(|e| {
+                    store.add_cert(x509).map_err(|e| {
                         TransportError::Config(format!("additional_roots: add_cert (boring): {e}"))
                     })?;
                 }
+                b.set_verify_cert_store(store.build())
+                    .map_err(|e| TransportError::Config(format!("set_verify_cert_store: {e}")))?;
             }
         }
 

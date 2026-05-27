@@ -457,6 +457,74 @@ fn parse_sniffer_config(raw: &raw::RawConfig) -> Result<SnifferConfig, anyhow::E
 /// at least one GEOSITE rule is present (same lazy pattern as GeoIP/ASN).
 /// Unlike GeoIP/ASN, the GEOSITE DB is tolerated as absent — per spec the
 /// rule no-matches at query time rather than failing at parse.
+/// Download missing geodata files that the config's rules require.
+///
+/// Parses the first proxy from the raw config for tunneled downloads (needed
+/// in regions where the CDN is blocked); falls back to a direct fetch when
+/// no proxy is configured. Download failures are logged as warnings — the
+/// subsequent parser-context build will hard-error if the file is still
+/// absent, giving a clear diagnostic.
+async fn ensure_geodata(raw: &raw::RawConfig, geo: &GeoDataConfig) {
+    let lines: &[String] = raw.rules.as_deref().unwrap_or(&[]);
+
+    let needs_geoip = lines.iter().any(|l| line_is_geoip_rule(l));
+    let needs_asn = lines.iter().any(|l| line_is_asn_rule(l));
+    let needs_geosite = lines.iter().any(|l| line_is_geosite_rule(l));
+
+    if !needs_geoip && !needs_asn && !needs_geosite {
+        return;
+    }
+
+    let geoip_path = geo.mmdb_path.clone().unwrap_or_else(default_geoip_path);
+    let asn_path = geo.asn_path.clone().unwrap_or_else(default_asn_path);
+    let geosite_path = geo
+        .geosite_path
+        .clone()
+        .unwrap_or_else(default_geosite_path);
+
+    let geoip_missing = needs_geoip && !geoip_path.exists();
+    let asn_missing = needs_asn && !asn_path.exists();
+    let geosite_missing = needs_geosite
+        && geo.geosite_path.as_ref().map_or_else(
+            || {
+                meow_rules::geosite::default_geosite_candidates()
+                    .iter()
+                    .all(|p| !p.exists())
+            },
+            |p| !p.exists(),
+        );
+
+    if !geoip_missing && !asn_missing && !geosite_missing {
+        return;
+    }
+
+    // Build a download proxy from the first configured proxy, if any.
+    let proxy: Option<Arc<dyn Proxy>> = raw
+        .proxies
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find_map(|raw_proxy| proxy_parser::parse_proxy(raw_proxy).ok());
+
+    let mut downloads = Vec::new();
+    if geoip_missing {
+        downloads.push((&geo.mmdb_url, geoip_path));
+    }
+    if asn_missing {
+        downloads.push((&geo.asn_url, asn_path));
+    }
+    if geosite_missing {
+        downloads.push((&geo.geosite_url, geosite_path));
+    }
+
+    for (url, dest) in downloads {
+        info!("geodata: downloading {} to {}", url, dest.display());
+        if let Err(e) = geodata::download_and_replace(url, &dest, proxy.as_ref()).await {
+            warn!("geodata: failed to download {} — {}", url, e);
+        }
+    }
+}
+
 /// Parse geodata paths from `raw.geodata` and build a `ParserContext` that
 /// respects any explicit path overrides. Used by both `build_config` and
 /// `rebuild_from_raw_impl` so all code paths honour the same config.
@@ -885,6 +953,11 @@ async fn build_config(
     // Missing/unreadable files yield an empty store — no fatal errors.
     let selector_store =
         cache_dir.map(|d| meow_proxy::SelectorStore::open(d.join("selector-cache.json")));
+
+    // Ensure geodata files exist — download any that are missing and needed
+    // by the config's rules. This must happen before building the parser
+    // context, which hard-errors on missing GeoIP/ASN files.
+    ensure_geodata(&raw, &geodata).await;
 
     // Build the parser context once and share across all passes.
     let ctx = build_parser_context_with_geo(&raw, &geodata)?;
