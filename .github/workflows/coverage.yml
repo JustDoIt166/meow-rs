@@ -58,7 +58,9 @@ jobs:
                --skip doh_resolves_example_com \
                --skip dot_bogus_sni_fails_cert_validation \
                --skip doh_bogus_sni_fails_cert_validation \
-               --skip dot_hostname_with_bootstrap_resolves
+               --skip dot_hostname_with_bootstrap_resolves \
+               --skip geosite_rss_10k_rules_100k_queries \
+               --skip live_download_from_default_urls
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
