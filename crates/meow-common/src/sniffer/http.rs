@@ -23,7 +23,7 @@ pub fn sniff_http(buf: &[u8]) -> Option<String> {
             if host.is_empty() {
                 return None;
             }
-            return Some(host.to_string());
+            return Some(host.to_ascii_lowercase());
         }
     }
     None

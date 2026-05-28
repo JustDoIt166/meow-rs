@@ -66,7 +66,9 @@ impl DomainIndex {
     /// The returned `&Arc<str>` lives as long as `self` — the caller can
     /// `Arc::clone` it for free if it needs to keep the name.
     pub fn search(&self, host: &str) -> Option<(usize, &Arc<str>)> {
-        self.trie.search(host).map(|(idx, adapter)| (*idx, adapter))
+        self.trie
+            .search_normalized(host)
+            .map(|(idx, adapter)| (*idx, adapter))
     }
 }
 

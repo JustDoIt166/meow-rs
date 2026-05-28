@@ -163,6 +163,16 @@ impl Metadata {
         }
     }
 
+    /// Convert a hostname to a lowercase `SmolStr`. Avoids allocation when the
+    /// input is already lowercase (common case for DNS-snooped domains).
+    pub fn lower_host(s: &str) -> SmolStr {
+        if s.bytes().any(|b| b.is_ascii_uppercase()) {
+            SmolStr::new(s.to_ascii_lowercase())
+        } else {
+            SmolStr::from(s)
+        }
+    }
+
     pub fn rule_host(&self) -> &str {
         if self.sniff_host.is_empty() {
             &self.host

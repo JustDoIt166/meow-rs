@@ -76,7 +76,9 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
 
         if name_type == 0x00 {
             let name_bytes = list.get(pos..pos + name_len)?;
-            return String::from_utf8(name_bytes.to_vec()).ok();
+            let mut s = String::from_utf8(name_bytes.to_vec()).ok()?;
+            s.make_ascii_lowercase();
+            return Some(s);
         }
         pos += name_len;
     }

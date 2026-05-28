@@ -152,7 +152,7 @@ async fn handle_socks5_inner(
         src_port: src_addr.port(),
         dst_ip,
         dst_port,
-        host: host.into(),
+        host: Metadata::lower_host(&host),
         in_name: in_name.into(),
         in_port,
         in_user: in_user.as_deref().map(Into::into),

@@ -113,7 +113,11 @@ impl DnsCache {
     /// avoid forcing the caller to clone — the cache owns its own copy.
     pub fn put(&self, domain: &str, ips: &[IpAddr], ttl: Duration) {
         let expire_at = Instant::now() + ttl;
-        let key: Arc<str> = Arc::from(domain);
+        let key: Arc<str> = if domain.bytes().any(|b| b.is_ascii_uppercase()) {
+            Arc::from(domain.to_ascii_lowercase().as_str())
+        } else {
+            Arc::from(domain)
+        };
 
         // One reverse-shard lock per unique shard; common case is N=2-4 IPs
         // so we just take each shard's lock per insert. For larger N we
