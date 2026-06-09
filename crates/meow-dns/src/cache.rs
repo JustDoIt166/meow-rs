@@ -20,11 +20,17 @@
 // reverse-entry domain allocation drops from N+1 to 1 per cache write.
 use lru::LruCache;
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 use smol_str::SmolStr;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// IP list returned by cache hits. Domains overwhelmingly resolve to 1–2
+/// addresses, which fit inline — making cache hits allocation-free in the
+/// common case.
+pub type IpList = SmallVec<[IpAddr; 2]>;
 
 struct CacheEntry {
     ips: Box<[IpAddr]>,
@@ -96,16 +102,20 @@ impl DnsCache {
         }
     }
 
-    pub fn get(&self, domain: &str) -> Option<Vec<IpAddr>> {
+    pub fn get(&self, domain: &str) -> Option<IpList> {
         let shard = &self.cache[shard_str(domain)];
         let mut cache = shard.lock();
+        let mut expired = false;
         if let Some(entry) = cache.get(domain) {
             if entry.expire_at > Instant::now() {
-                return Some(entry.ips.to_vec());
+                return Some(SmallVec::from_slice(&entry.ips));
             }
-            // Expired, but don't remove here to avoid borrow issues
+            // Expired — flag for eviction; can't pop while `entry` borrows.
+            expired = true;
         }
-        cache.pop(domain);
+        if expired {
+            cache.pop(domain);
+        }
         None
     }
 
@@ -207,7 +217,7 @@ mod tests {
         let c = DnsCache::new(64);
         let ips = vec![ipv4(1, 2, 3, 4), ipv4(5, 6, 7, 8)];
         c.put("a.example", &ips, Duration::from_secs(30));
-        assert_eq!(c.get("a.example"), Some(ips));
+        assert_eq!(c.get("a.example").as_deref(), Some(&ips[..]));
         assert!(c.get("nope.example").is_none());
     }
 
@@ -257,7 +267,10 @@ mod tests {
         let c = DnsCache::new(64);
         c.put("dup.example", &[ipv4(1, 1, 1, 1)], Duration::from_secs(30));
         c.put("dup.example", &[ipv4(2, 2, 2, 2)], Duration::from_secs(30));
-        assert_eq!(c.get("dup.example"), Some(vec![ipv4(2, 2, 2, 2)]));
+        assert_eq!(
+            c.get("dup.example").as_deref(),
+            Some(&[ipv4(2, 2, 2, 2)][..])
+        );
     }
 
     #[test]
@@ -279,7 +292,7 @@ mod tests {
         // lookup returns an empty Vec without touching the reverse table.
         let c = DnsCache::new(64);
         c.put("nx.example", &[], Duration::from_secs(30));
-        assert_eq!(c.get("nx.example"), Some(vec![]));
+        assert_eq!(c.get("nx.example").as_deref(), Some(&[][..]));
         assert_eq!(c.reverse_len(), 0);
     }
 
@@ -288,7 +301,7 @@ mod tests {
         let c = DnsCache::new(64);
         let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
         c.put("v6.example", &[v6], Duration::from_secs(30));
-        assert_eq!(c.get("v6.example"), Some(vec![v6]));
+        assert_eq!(c.get("v6.example").as_deref(), Some(&[v6][..]));
         assert_eq!(c.reverse_lookup(v6).as_deref(), Some("v6.example"));
     }
 

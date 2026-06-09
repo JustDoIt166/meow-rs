@@ -11,7 +11,7 @@ fn test_cache_put_and_get() {
 
     let result = cache.get("example.com");
     assert!(result.is_some());
-    assert_eq!(result.unwrap(), ips);
+    assert_eq!(result.unwrap().as_slice(), ips.as_slice());
 }
 
 #[test]
@@ -33,7 +33,7 @@ fn test_cache_multiple_ips() {
 
     let result = cache.get("cloudflare.com").unwrap();
     assert_eq!(result.len(), 3);
-    assert_eq!(result, ips);
+    assert_eq!(result.as_slice(), ips.as_slice());
 }
 
 #[test]
@@ -46,7 +46,7 @@ fn test_cache_overwrite() {
     cache.put("example.com", &ips2, Duration::from_secs(300));
 
     let result = cache.get("example.com").unwrap();
-    assert_eq!(result, ips2);
+    assert_eq!(result.as_slice(), ips2.as_slice());
 }
 
 #[test]
@@ -236,6 +236,6 @@ fn test_cache_different_domains_independent() {
     cache.put("a.com", &ips_a, Duration::from_secs(300));
     cache.put("b.com", &ips_b, Duration::from_secs(300));
 
-    assert_eq!(cache.get("a.com").unwrap(), ips_a);
-    assert_eq!(cache.get("b.com").unwrap(), ips_b);
+    assert_eq!(cache.get("a.com").unwrap().as_slice(), ips_a.as_slice());
+    assert_eq!(cache.get("b.com").unwrap().as_slice(), ips_b.as_slice());
 }
