@@ -129,7 +129,7 @@ Field semantics (ordered by spec impact, not alphabetically):
 | `override-destination` | bool | `false` | When `true`, a successful sniff overwrites `Metadata.host` in addition to `sniff_host`. Affects outbound TLS SNI / HTTP Host rewrites. See **Trojan cert-validation gotcha** below. |
 | `force-domain` | list<glob> | empty | Domains in this list bypass `parse-pure-ip`'s "skip if already a hostname" short-circuit. Useful for domains whose Happy-Eyeballs DNS resolved locally but you still want routed by the *real* SNI seen on the wire. |
 | `skip-domain` | list<glob> | empty | Domains in this list are never sniffed even if eligible. Applied *after* extraction — if the sniffed SNI matches a `skip-domain` entry, the result is discarded and `sniff_host` is left empty. |
-| `force-dns-mapping` | bool | `false` | **Accepted and ignored.** Upstream uses it to reuse fake-ip reverse mappings when sniffing. We do not implement fake-ip (`vision.md` non-goal); parser warns once on `true` and proceeds. Divergence documented here so config compat stays. |
+| `force-dns-mapping` | bool | `false` | **Accepted and ignored.** Upstream uses it to reuse fake-ip reverse mappings when sniffing. meow-rs implements fake-ip, but the sniffer never consults its reverse table — `Tunnel::pre_handle_metadata` already rewrites fake IPs back to their hostnames before sniffing — so the flag is inert; parser warns once on `true` and proceeds. Divergence documented here so config compat stays. |
 
 Glob matcher: reuse `meow-trie::DomainTrie` for `skip-domain` and
 `force-domain`. The existing trie already handles `+.example.com`,
@@ -174,15 +174,19 @@ architect 2026-04-11): upstream fields that, if silently ignored, would
 cause a **security or evasion gap** — e.g., a user assumes uTLS
 fingerprint spoofing is active when it isn't — are rejected at parse
 time with a hard error. Upstream fields whose absence only means a
-*less-optimal code path* — e.g., `force-dns-mapping` can't reuse a
-fake-ip table we don't implement — are accepted with a warn. The user's
+*less-optimal code path* — e.g., `force-dns-mapping` is inert because
+the sniffer never consults the fake-ip reverse table — are accepted
+with a warn. The user's
 traffic still routes correctly; they just get a log entry telling them
 why the field is inert. Apply this rule whenever deciding between
 warn-and-ignore vs hard-error on an unimplemented upstream knob.
 
 1. **`force-dns-mapping` accepted-and-ignored.** Upstream uses this to
-   patch back fake-ip reverse lookups into the sniff result. We do not
-   implement fake-ip at all, so there is no mapping table to consult.
+   patch back fake-ip reverse lookups into the sniff result. meow-rs
+   implements fake-ip (re-added in PR #64), but the sniffer has nothing
+   to patch back: `Tunnel::pre_handle_metadata` rewrites fake IPs to
+   their hostnames before the sniffer runs, so the reverse table is
+   already applied upstream of sniffing.
    Parser emits a single `tracing::warn!` at load time and continues.
 2. **No `QUIC` sniffer.** Upstream ships one; we do not. Parser warns
    and ignores `sniff.QUIC.ports` if present.
@@ -547,8 +551,9 @@ tests live alongside the runtime, not in `meow-common`.
   another await.
 - `sniffer_force_dns_mapping_true_emits_one_warn` — use a
   tracing-capture layer. Upstream: dispatcher/sniffer reuses fake-ip
-  reverse mappings here. NOT implemented in meow-rs (fake-ip is a
-  `vision.md` non-goal); accept-and-warn is the documented divergence.
+  reverse mappings here. In meow-rs the sniffer never consults the
+  fake-ip reverse table (the tunnel rewrites fake IPs to hostnames
+  before sniffing); accept-and-warn is the documented divergence.
 
 **Unit (`crates/meow-config/tests/config_test.rs`):** config-parser
 tests for the synthesis and validation paths — these are load-time
