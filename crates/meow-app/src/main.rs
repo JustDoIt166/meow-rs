@@ -18,7 +18,7 @@ use meow_listener::SnifferRuntime;
 use meow_listener::TProxyListener;
 use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -412,6 +412,21 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Build a listener bind address from an IP-literal `listen` string and a port.
+///
+/// Parses `listen` as an `IpAddr` and composes via `SocketAddr::new`, instead
+/// of `format!("{listen}:{port}")`. The string form produces an unparseable
+/// `:::7890` for an IPv6 listen address like `::`, which silently broke
+/// dual-stack binding (`bind-address: '::'`); `SocketAddr::new` handles IPv4
+/// and IPv6 uniformly. `listen` is always an IP literal here (`0.0.0.0`, `::`,
+/// `127.0.0.1`, or a specific address).
+fn bind_socket_addr(listen: &str, port: u16) -> Result<SocketAddr> {
+    let ip: IpAddr = listen
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid bind address '{listen}': {e}"))?;
+    Ok(SocketAddr::new(ip, port))
+}
+
 async fn run(
     config: meow_config::Config,
     config_path: String,
@@ -569,7 +584,8 @@ async fn run(
     use meow_config::ListenerType;
 
     for nl in &config.listeners.named {
-        let addr: SocketAddr = format!("{}:{}", nl.listen, nl.port).parse()?;
+        let addr = bind_socket_addr(&nl.listen, nl.port)
+            .map_err(|e| anyhow::anyhow!("listener '{}': {e}", nl.name))?;
         // Suppress unused-variable warning: addr is consumed only inside
         // feature-gated match arms below.
         let _ = addr;
@@ -631,4 +647,38 @@ async fn run(
     info!("Shutting down...");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_socket_addr;
+
+    #[test]
+    fn ipv4_bind_address() {
+        let a = bind_socket_addr("0.0.0.0", 7890).unwrap();
+        assert_eq!(a.to_string(), "0.0.0.0:7890");
+        assert!(a.is_ipv4());
+    }
+
+    #[test]
+    fn ipv6_unspecified_bind_address_is_dual_stack() {
+        // Regression: format!("{}:{}", "::", port) yields the unparseable
+        // ":::7890". SocketAddr::new must bracket it correctly so that
+        // `bind-address: '::'` actually binds (and on Linux accepts both
+        // IPv4 and IPv6 LAN clients).
+        let a = bind_socket_addr("::", 7890).unwrap();
+        assert_eq!(a.to_string(), "[::]:7890");
+        assert!(a.is_ipv6());
+    }
+
+    #[test]
+    fn specific_ipv6_bind_address() {
+        let a = bind_socket_addr("2408:820c:8f4b:9b41::1001", 9090).unwrap();
+        assert_eq!(a.to_string(), "[2408:820c:8f4b:9b41::1001]:9090");
+    }
+
+    #[test]
+    fn invalid_bind_address_errors() {
+        assert!(bind_socket_addr("not-an-ip", 80).is_err());
+    }
 }
