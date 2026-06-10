@@ -2123,6 +2123,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "smallvec",
  "smol_str",
  "sysinfo",
  "thiserror 2.0.18",
