@@ -746,7 +746,8 @@ fn line_is_asn_rule(line: &str) -> bool {
 }
 
 /// Default path for the GeoIP Country MMDB.
-/// Honours `$XDG_CONFIG_HOME` if set, otherwise `$HOME/.config/meow`.
+/// Honours `-d` (set via `meow_common::set_home_dir`), then `$XDG_CONFIG_HOME`,
+/// then `$HOME/.config/meow`.
 pub fn default_geoip_path() -> PathBuf {
     meow_config_dir().join("Country.mmdb")
 }
@@ -764,7 +765,17 @@ pub fn default_geosite_path() -> PathBuf {
     meow_config_dir().join("geosite.dat")
 }
 
+/// Return the meow home directory.
+///
+/// Priority (highest first):
+/// 1. Value set by `meow_common::set_home_dir` (from the `-d` CLI flag).
+/// 2. `$XDG_CONFIG_HOME/meow` if `XDG_CONFIG_HOME` is set.
+/// 3. `$HOME/.config/meow` if `HOME` is set.
+/// 4. `.` (current working directory) as last resort.
 pub fn meow_config_dir() -> PathBuf {
+    if let Some(d) = meow_common::meow_home_dir() {
+        return d;
+    }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))

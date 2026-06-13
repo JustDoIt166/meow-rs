@@ -23,8 +23,6 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub enum BootstrapError {
     #[error("default-nameserver entry '{entry}' must be a plain UDP/TCP nameserver (tls:// and https:// are not allowed here because they would create a bootstrap loop)")]
     DefaultNameserverNotPlain { entry: String },
-    #[error("default-nameserver: is required when nameserver contains an encrypted entry with a hostname ('{first_encrypted}')")]
-    DefaultNameserverMissing { first_encrypted: String },
     #[error("cannot resolve '{host}' via bootstrap nameserver: {source}")]
     CannotResolve { host: String, source: BoxError },
     #[error("failed to parse nameserver '{input}': {source}")]
@@ -219,6 +217,47 @@ fn url_to_plain_socketaddr(url: &NameServerUrl) -> SocketAddr {
             SocketAddr::new(ip, 53)
         }
     }
+}
+
+/// Read the platform's configured recursive resolvers, used as bootstrap
+/// nameservers when `default-nameserver` is absent but an encrypted upstream
+/// (DoH/DoT) carries a hostname that must be resolved first.
+///
+/// Unix: parse `/etc/resolv.conf` `nameserver` lines (port 53, UDP). Other
+/// platforms — or a missing / unreadable resolv.conf yielding no addresses —
+/// fall back to well-known public resolvers so bootstrap still succeeds in an
+/// unconfigured environment. This mirrors mihomo's behaviour and the helper of
+/// the same name in `meow-config::ech_dns`; the logic is duplicated rather than
+/// shared because `meow-config` depends on `meow-dns`, not the reverse.
+fn system_nameservers() -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    #[cfg(unix)]
+    {
+        if let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") {
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                    continue;
+                }
+                let Some(rest) = line.strip_prefix("nameserver") else {
+                    continue;
+                };
+                let token = rest.split_whitespace().next().unwrap_or("");
+                // Strip an optional IPv6 zone identifier (`fe80::1%en0`):
+                // `IpAddr::from_str` rejects the `%zone` suffix.
+                let addr_str = token.split('%').next().unwrap_or(token);
+                if let Ok(ip) = addr_str.parse::<IpAddr>() {
+                    out.push(SocketAddr::new(ip, 53));
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        // Fallback: well-known public resolvers.
+        out.push(SocketAddr::from(([1, 1, 1, 1], 53)));
+        out.push(SocketAddr::from(([8, 8, 8, 8], 53)));
+    }
+    out
 }
 
 /// Query a pool of clients in parallel; return the first successful A+AAAA
@@ -495,24 +534,33 @@ impl Resolver {
         let resolved_map: HashMap<String, IpAddr> = if hostnames_needing_bootstrap.is_empty() {
             HashMap::new()
         } else {
-            if default_ns.is_empty() {
-                return Err(BootstrapError::DefaultNameserverMissing {
-                    first_encrypted: first_encrypted_with_hostname.unwrap_or_default(),
-                });
-            }
-
-            // Step 4: Build throwaway bootstrap clients (one per default_ns).
-            let bootstrap_clients: Vec<Arc<DnsClient>> = default_ns
-                .iter()
-                .map(|ns| {
-                    let addr = url_to_plain_socketaddr(ns);
-                    let c = match ns {
-                        NameServerUrl::Tcp { .. } => DnsClient::tcp(addr),
-                        _ => DnsClient::udp(addr),
-                    };
-                    Arc::new(c.with_timeout(Duration::from_secs(3)))
-                })
-                .collect();
+            // Step 4: Build throwaway bootstrap clients. When `default-nameserver`
+            // is configured, use it. When absent, fall back to the system
+            // resolvers (mihomo reads /etc/resolv.conf here rather than erroring).
+            let bootstrap_clients: Vec<Arc<DnsClient>> = if default_ns.is_empty() {
+                let system = system_nameservers();
+                tracing::warn!(
+                    "default-nameserver not configured; bootstrapping '{}' via system DNS ({} server(s) from /etc/resolv.conf or hardcoded fallback)",
+                    first_encrypted_with_hostname.as_deref().unwrap_or("?"),
+                    system.len(),
+                );
+                system
+                    .into_iter()
+                    .map(|addr| Arc::new(DnsClient::udp(addr).with_timeout(Duration::from_secs(3))))
+                    .collect()
+            } else {
+                default_ns
+                    .iter()
+                    .map(|ns| {
+                        let addr = url_to_plain_socketaddr(ns);
+                        let c = match ns {
+                            NameServerUrl::Tcp { .. } => DnsClient::tcp(addr),
+                            _ => DnsClient::udp(addr),
+                        };
+                        Arc::new(c.with_timeout(Duration::from_secs(3)))
+                    })
+                    .collect()
+            };
 
             // Resolve sequentially — fail-fast on first failure.
             let mut map = HashMap::new();
@@ -1129,12 +1177,15 @@ mod tests {
         assert!(result.is_ok(), "tcp in default_ns must be accepted");
     }
 
-    // B8: encrypted hostname upstream with empty default_ns → DefaultNameserverMissing.
+    // B8: encrypted hostname upstream with empty default_ns falls back to
+    // system DNS (mihomo-compat, issue #201 item 3) instead of hard-erroring.
+    // Outcome is network-dependent: Ok when the system resolvers answer, or
+    // CannotResolve when offline. We must never see a DefaultNameserver* error.
     #[tokio::test]
-    async fn bootstrap_missing_when_encrypted_has_hostname() {
+    async fn bootstrap_falls_back_to_system_dns_when_encrypted_has_hostname() {
         let main = vec![NameServerUrl::parse("https://cloudflare-dns.com/dns-query").unwrap()];
         let hosts = DomainTrie::new();
-        let err = Resolver::new_with_bootstrap(
+        let result = Resolver::new_with_bootstrap(
             main,
             vec![],
             vec![],
@@ -1145,11 +1196,10 @@ mod tests {
             None,
         )
         .await
-        .err()
-        .expect("expected error");
+        .map(|_| ());
         assert!(
-            matches!(err, BootstrapError::DefaultNameserverMissing { .. }),
-            "expected DefaultNameserverMissing, got: {err}"
+            matches!(result, Ok(()) | Err(BootstrapError::CannotResolve { .. })),
+            "expected Ok or CannotResolve (offline), got: {result:?}"
         );
     }
 
@@ -1172,13 +1222,14 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // C8 guard: fallback with encrypted hostname also requires default_ns.
+    // C8: a fallback (not just main) encrypted hostname with empty default_ns
+    // also bootstraps via system DNS rather than erroring (issue #201 item 3).
     #[tokio::test]
-    async fn bootstrap_missing_when_fallback_encrypted_has_hostname() {
+    async fn bootstrap_falls_back_to_system_dns_when_fallback_encrypted_has_hostname() {
         let main = vec![NameServerUrl::parse("8.8.8.8").unwrap()];
         let fallback = vec![NameServerUrl::parse("https://dns.quad9.net/dns-query").unwrap()];
         let hosts = DomainTrie::new();
-        let err = Resolver::new_with_bootstrap(
+        let result = Resolver::new_with_bootstrap(
             main,
             fallback,
             vec![],
@@ -1189,12 +1240,23 @@ mod tests {
             None,
         )
         .await
-        .err()
-        .expect("expected error");
-        assert!(matches!(
-            err,
-            BootstrapError::DefaultNameserverMissing { .. }
-        ));
+        .map(|_| ());
+        assert!(
+            matches!(result, Ok(()) | Err(BootstrapError::CannotResolve { .. })),
+            "expected Ok or CannotResolve (offline), got: {result:?}"
+        );
+    }
+
+    // system_nameservers always yields at least one bootstrap address (resolv.conf
+    // entries on Unix, or the hardcoded public-resolver fallback otherwise).
+    #[test]
+    fn system_nameservers_never_empty() {
+        let ns = system_nameservers();
+        assert!(!ns.is_empty(), "system_nameservers must never be empty");
+        assert!(
+            ns.iter().all(|a| a.port() == 53),
+            "bootstrap nameservers must use port 53"
+        );
     }
 
     // use_hosts=false bypasses the hosts trie.

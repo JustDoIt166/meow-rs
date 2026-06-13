@@ -23,6 +23,7 @@ pub struct ProxyProvider {
     exclude_filter: Option<regex::Regex>,
     exclude_type: Vec<String>,
     pub health_check: Option<HealthCheckConfig>,
+    header: HashMap<String, String>,
 }
 
 enum Vehicle {
@@ -91,6 +92,7 @@ impl ProxyProvider {
             .collect();
 
         let health_check = build_health_check_config(raw.health_check.as_ref());
+        let header = raw.header.clone().unwrap_or_default();
 
         Ok(Self {
             name: name.to_string(),
@@ -101,6 +103,7 @@ impl ProxyProvider {
             exclude_filter,
             exclude_type,
             health_check,
+            header,
         })
     }
 
@@ -113,7 +116,21 @@ impl ProxyProvider {
                 )
             }),
             Vehicle::Http { url, cache_path } => {
-                match reqwest::get(url).await {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .user_agent(concat!("clash.meta/", env!("CARGO_PKG_VERSION")))
+                    .build()
+                    .map_err(|e| {
+                        format!(
+                            "proxy-provider '{}': failed to build HTTP client: {}",
+                            self.name, e
+                        )
+                    })?;
+                let mut req = client.get(url);
+                for (k, v) in &self.header {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+                match req.send().await {
                     Ok(resp) if resp.status().is_success() => {
                         match resp.text().await {
                             Ok(text) => {
@@ -277,4 +294,80 @@ fn build_health_check_config(raw: Option<&RawHealthCheck>) -> Option<HealthCheck
         timeout: hc.timeout.unwrap_or(5000),
         lazy: hc.lazy.unwrap_or(false),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raw::RawProxyProvider;
+
+    fn raw_file_provider(path: &str) -> RawProxyProvider {
+        RawProxyProvider {
+            provider_type: "file".to_string(),
+            url: None,
+            path: Some(path.to_string()),
+            interval: None,
+            filter: None,
+            exclude_filter: None,
+            exclude_type: None,
+            health_check: None,
+            header: None,
+        }
+    }
+
+    #[test]
+    fn file_provider_new_succeeds() {
+        let raw = raw_file_provider("/tmp/proxies.yaml");
+        let p = ProxyProvider::new("test", &raw, None).unwrap();
+        assert_eq!(p.name, "test");
+        assert_eq!(p.vehicle_type, "File");
+        assert!(p.header.is_empty());
+    }
+
+    #[test]
+    fn http_provider_new_with_custom_headers() {
+        let mut headers = HashMap::new();
+        headers.insert("X-Token".to_string(), "secret".to_string());
+        let raw = RawProxyProvider {
+            provider_type: "http".to_string(),
+            url: Some("https://example.com/proxies.yaml".to_string()),
+            path: None,
+            interval: None,
+            filter: None,
+            exclude_filter: None,
+            exclude_type: None,
+            health_check: None,
+            header: Some(headers),
+        };
+        let p = ProxyProvider::new("airport", &raw, None).unwrap();
+        assert_eq!(p.vehicle_type, "HTTP");
+        assert_eq!(p.header.get("X-Token").map(String::as_str), Some("secret"));
+    }
+
+    #[test]
+    fn raw_proxy_provider_deserializes_header() {
+        let yaml = r#"
+type: http
+url: "https://example.com/proxies.yaml"
+header:
+  Authorization: "Bearer token123"
+  X-Custom: "value"
+"#;
+        let raw: RawProxyProvider = serde_yaml::from_str(yaml).unwrap();
+        let headers = raw.header.unwrap();
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer token123")
+        );
+        assert_eq!(headers.get("X-Custom").map(String::as_str), Some("value"));
+    }
+
+    #[test]
+    fn raw_proxy_provider_no_header_defaults_empty() {
+        let yaml = "type: file\npath: /tmp/proxies.yaml\n";
+        let raw: RawProxyProvider = serde_yaml::from_str(yaml).unwrap();
+        assert!(raw.header.is_none());
+        let p = ProxyProvider::new("p", &raw, None).unwrap();
+        assert!(p.header.is_empty());
+    }
 }

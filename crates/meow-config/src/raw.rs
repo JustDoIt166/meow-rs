@@ -253,6 +253,8 @@ pub struct RawProxyProvider {
     )]
     pub exclude_type: Option<Vec<String>>,
     pub health_check: Option<RawHealthCheck>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
