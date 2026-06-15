@@ -9,6 +9,7 @@ RUN apk add --no-cache \
     perl \
     go \
     nasm \
+    git \
     # ---- bindgen (libclang) ----
     clang \
     clang-dev \
