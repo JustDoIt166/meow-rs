@@ -392,9 +392,7 @@ fn parse_http(
 ///
 /// - `username` set without `password` (or vice versa) — orphaned credential.
 ///
-/// # Warn-once (Class B per ADR-0002)
-///
-/// - `udp: true` — SOCKS5 UDP ASSOCIATE is deferred to M1.x.
+/// `udp: true` enables SOCKS5 UDP ASSOCIATE (HTTP/3 / QUIC relay).
 ///
 /// upstream: `adapter/outbound/socks5.go`
 fn parse_socks5(
@@ -431,27 +429,12 @@ fn parse_socks5(
         }
     };
 
-    // Warn-once if UDP is requested (deferred, ADR-0002 Class B).
-    if config
+    let udp = config
         .get("udp")
         .and_then(serde_yaml::Value::as_bool)
-        .unwrap_or(false)
-    {
-        tracing::warn!(
-            proxy = name,
-            "socks5: `udp: true` is not supported in M1 (SOCKS5 UDP ASSOCIATE deferred); \
-             treating as false. Class B — ADR-0002."
-        );
-    }
+        .unwrap_or(false);
 
-    Ok(Socks5Adapter::new(
-        name,
-        server,
-        port,
-        auth,
-        tls,
-        skip_cert_verify,
-    ))
+    Ok(Socks5Adapter::new(name, server, port, auth, tls, skip_cert_verify).with_udp(udp))
 }
 
 /// Parse a `type: direct` proxy block into a [`DirectAdapter`].
