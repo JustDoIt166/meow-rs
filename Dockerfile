@@ -1,70 +1,57 @@
-# ---- Builder ----
-FROM rust:1.89-alpine AS builder
- 
-RUN apk add --no-cache \
-    # ---- BoringSSL cmake 编译 ----
+# ---- chef：基础系统工具 + cargo-chef ----
+FROM rust:1.89-slim-bookworm AS chef
+RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     g++ \
     make \
+    pkg-config \
+    libssl-dev \
     perl \
-    go \
+    golang-go \
     nasm \
     git \
-    # ---- bindgen (libclang) ----
     clang \
-    clang-dev \
+    libclang-dev \
     llvm-dev \
-    # ---- Rust 基础 ----
-    musl-dev \
-    linux-headers
- 
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cargo install cargo-chef --locked
 WORKDIR /usr/src/meow-rs
- 
-# 依赖缓存层
-COPY Cargo.toml Cargo.lock ./
-COPY crates/meow-common/Cargo.toml   crates/meow-common/Cargo.toml
-COPY crates/meow-trie/Cargo.toml     crates/meow-trie/Cargo.toml
-COPY crates/meow-dns/Cargo.toml      crates/meow-dns/Cargo.toml
-COPY crates/meow-rules/Cargo.toml    crates/meow-rules/Cargo.toml
-COPY crates/meow-transport/Cargo.toml crates/meow-transport/Cargo.toml
-COPY crates/meow-proxy/Cargo.toml    crates/meow-proxy/Cargo.toml
-COPY crates/meow-tunnel/Cargo.toml   crates/meow-tunnel/Cargo.toml
-COPY crates/meow-listener/Cargo.toml crates/meow-listener/Cargo.toml
-COPY crates/meow-api/Cargo.toml      crates/meow-api/Cargo.toml
-COPY crates/meow-config/Cargo.toml   crates/meow-config/Cargo.toml
-COPY crates/meow-app/Cargo.toml      crates/meow-app/Cargo.toml
- 
-RUN find crates -name Cargo.toml -exec sh -c ' \
-    dir=$(dirname {}); \
-    mkdir -p "$dir/src" && touch "$dir/src/lib.rs"; \
-  ' \;
- 
-# Alpine 上 libclang.so 可能在 /usr/lib/llvmXX/lib/ 下
-# bindgen 未必能自动找到，显式设置 LIBCLANG_PATH
-ENV LIBCLANG_PATH=/usr/lib
- 
-RUN cargo build --release --bin meow 2>/dev/null || true
- 
+
+# ---- planner：分析依赖 ----
+FROM chef AS planner
 COPY . .
-RUN touch crates/*/src/lib.rs crates/meow-app/src/main.rs
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---- builder：编译依赖 + 最终 binary ----
+FROM chef AS builder
+COPY --from=planner /usr/src/meow-rs/recipe.json recipe.json
+# 仅编译依赖（彻底缓存）
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# 复制源码并构建
+COPY . .
 RUN cargo build --release --bin meow
- 
-# ---- Runtime ----
-FROM alpine:3.21
- 
-RUN apk add --no-cache ca-certificates \
-    && addgroup -S meow && adduser -S meow -G meow
- 
+
+# ---- runtime：最小运行环境 ----
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && addgroup --system meow && adduser --system --ingroup meow meow
+
 COPY --from=builder /usr/src/meow-rs/target/release/meow /usr/local/bin/meow
-COPY config.example.yaml /etc/meow/config.yaml
- 
+
+# 如果不存在 config.example.yaml，生成默认配置
+RUN if [ ! -f config.example.yaml ]; then \
+        echo "# default config" > /etc/meow/config.yaml; \
+    else \
+        cp config.example.yaml /etc/meow/config.yaml; \
+    fi
 RUN chown meow:meow /etc/meow/config.yaml
- 
+
 USER meow
- 
 EXPOSE 7890 9090 1053/udp 1053/tcp
- 
 VOLUME ["/etc/meow"]
- 
 ENTRYPOINT ["meow"]
 CMD ["-f", "/etc/meow/config.yaml"]
