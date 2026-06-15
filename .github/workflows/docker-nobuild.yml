@@ -1,19 +1,17 @@
-name: Docker Images  without build
+name: Docker Images without build
 
 on:
-  release:
-    types: [published]
-
   workflow_dispatch:
     inputs:
       tag:
-        description: "要构建 Docker 镜像的 Release Tag，例如 v0.14.0"
+        description: "上游 madeye/meow-rs 的 Release Tag，例如 v0.14.0"
         required: true
+        default: "v0.14.0"
         type: string
       push_latest:
         description: "是否额外推送 latest-scratch / latest-alpine"
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -22,10 +20,11 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
+  RELEASE_REPO: madeye/meow-rs
 
 jobs:
   docker:
-    name: Build scratch and alpine images
+    name: Build scratch and alpine images from upstream release
     runs-on: ubuntu-latest
 
     steps:
@@ -35,13 +34,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            TAG="${{ github.event.release.tag_name }}"
-            PUSH_LATEST="${{ github.event.release.prerelease == false }}"
-          else
-            TAG="${{ inputs.tag }}"
-            PUSH_LATEST="${{ inputs.push_latest }}"
-          fi
+          TAG="${{ inputs.tag }}"
+          PUSH_LATEST="${{ inputs.push_latest }}"
 
           IMAGE="${REGISTRY}/${GITHUB_REPOSITORY,,}"
           VERSION="${TAG#v}"
@@ -56,21 +50,27 @@ jobs:
           echo "TAG=${TAG}"
           echo "VERSION=${VERSION}"
           echo "IMAGE=${IMAGE}"
+          echo "RELEASE_REPO=${RELEASE_REPO}"
           echo "PUSH_LATEST=${PUSH_LATEST}"
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.vars.outputs.tag }}
-
-      - name: Resolve git revision
+      - name: Resolve upstream release revision
         id: git
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.vars.outputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Download release binaries
+          REVISION="$(gh release view "${TAG}" \
+            --repo "${RELEASE_REPO}" \
+            --json targetCommitish \
+            --jq '.targetCommitish')"
+
+          echo "revision=${REVISION}" >> "$GITHUB_OUTPUT"
+          echo "REVISION=${REVISION}"
+
+      - name: Prepare Docker context and download upstream binaries
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.vars.outputs.tag }}
@@ -87,42 +87,56 @@ jobs:
             local target="$2"
             local asset="meow-${TAG}-${target}.tar.gz"
             local checksum="${asset}.sha256"
+            local extract_dir="dist/extract-${arch}"
 
-            echo "Downloading ${asset}"
+            echo "Downloading ${asset} from ${RELEASE_REPO}"
 
             gh release download "${TAG}" \
-              --repo "${GITHUB_REPOSITORY}" \
+              --repo "${RELEASE_REPO}" \
               --pattern "${asset}" \
               --dir dist \
               --clobber
 
-            gh release download "${TAG}" \
-              --repo "${GITHUB_REPOSITORY}" \
+            if gh release download "${TAG}" \
+              --repo "${RELEASE_REPO}" \
               --pattern "${checksum}" \
               --dir dist \
-              --clobber
+              --clobber; then
+              (
+                cd dist
+                sha256sum -c "${checksum}"
+              )
+            else
+              echo "Checksum file ${checksum} not found, skipping checksum verification."
+            fi
 
-            (
-              cd dist
-              sha256sum -c "${checksum}"
-            )
+            rm -rf "${extract_dir}"
+            mkdir -p "${extract_dir}"
 
-            tar -xzf "dist/${asset}" -C dist
+            tar -xzf "dist/${asset}" -C "${extract_dir}"
 
-            cp "dist/meow-${TAG}-${target}/meow" "docker-context/binaries/${arch}/meow"
+            bin_path="$(find "${extract_dir}" -type f -name meow | head -n 1)"
+
+            if [[ -z "${bin_path}" ]]; then
+              echo "Cannot find meow binary in ${asset}"
+              find "${extract_dir}" -maxdepth 3 -type f -print
+              exit 1
+            fi
+
+            cp "${bin_path}" "docker-context/binaries/${arch}/meow"
             chmod +x "docker-context/binaries/${arch}/meow"
+
+            echo "Prepared ${arch} binary: docker-context/binaries/${arch}/meow"
           }
 
           download_one "amd64" "x86_64-unknown-linux-musl"
           download_one "arm64" "aarch64-unknown-linux-musl"
 
-          if [[ -f config.example.yaml ]]; then
-            cp config.example.yaml docker-context/config.example.yaml
-          else
-            cat > docker-context/config.example.yaml <<'EOF'
-          # Mount your real config to /etc/meow/config.yaml
+          cat > docker-context/config.yaml <<'EOF'
+          # Mount your real meow config to /etc/meow/config.yaml
+          # Example:
+          # docker run -v ./config.yaml:/etc/meow/config.yaml:ro ...
           EOF
-          fi
 
       - name: Generate Dockerfiles
         shell: bash
@@ -150,7 +164,7 @@ jobs:
           COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
           COPY --chmod=0755 binaries/${TARGETARCH}/meow /usr/local/bin/meow
-          COPY config.example.yaml /etc/meow/config.yaml
+          COPY config.yaml /etc/meow/config.yaml
 
           EXPOSE 7890/tcp
           EXPOSE 9090/tcp
@@ -182,7 +196,7 @@ jobs:
             && adduser -S -D -H -h /nonexistent -s /sbin/nologin -G meow meow
 
           COPY --chmod=0755 binaries/${TARGETARCH}/meow /usr/local/bin/meow
-          COPY config.example.yaml /etc/meow/config.yaml
+          COPY config.yaml /etc/meow/config.yaml
 
           EXPOSE 7890/tcp
           EXPOSE 9090/tcp
@@ -225,6 +239,14 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+          echo "Scratch tags:"
+          echo "${IMAGE}:${TAG}-scratch"
+          echo "${IMAGE}:${VERSION}-scratch"
+
+          echo "Alpine tags:"
+          echo "${IMAGE}:${TAG}-alpine"
+          echo "${IMAGE}:${VERSION}-alpine"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -249,13 +271,13 @@ jobs:
           build-args: |
             VERSION=${{ steps.vars.outputs.version }}
             REVISION=${{ steps.git.outputs.revision }}
-            SOURCE=${{ github.server_url }}/${{ github.repository }}
+            SOURCE=https://github.com/${{ env.RELEASE_REPO }}
           labels: |
             org.opencontainers.image.title=meow-rs
             org.opencontainers.image.description=Minimal scratch image for meow-rs
             org.opencontainers.image.version=${{ steps.vars.outputs.version }}
             org.opencontainers.image.revision=${{ steps.git.outputs.revision }}
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/${{ env.RELEASE_REPO }}
             org.opencontainers.image.variant=scratch
           provenance: true
           sbom: true
@@ -271,13 +293,13 @@ jobs:
           build-args: |
             VERSION=${{ steps.vars.outputs.version }}
             REVISION=${{ steps.git.outputs.revision }}
-            SOURCE=${{ github.server_url }}/${{ github.repository }}
+            SOURCE=https://github.com/${{ env.RELEASE_REPO }}
           labels: |
             org.opencontainers.image.title=meow-rs
             org.opencontainers.image.description=Alpine debug image for meow-rs
             org.opencontainers.image.version=${{ steps.vars.outputs.version }}
             org.opencontainers.image.revision=${{ steps.git.outputs.revision }}
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/${{ env.RELEASE_REPO }}
             org.opencontainers.image.variant=alpine
           provenance: true
           sbom: true
