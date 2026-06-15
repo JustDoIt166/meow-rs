@@ -4,6 +4,7 @@ FROM rust:1.89-alpine AS builder
 RUN apk add --no-cache \
     cmake g++ make perl go \
     # BoringSSL 还需要这些
+     clang llvm-dev \
     git linux-headers
  
 WORKDIR /usr/src/meow-rs
