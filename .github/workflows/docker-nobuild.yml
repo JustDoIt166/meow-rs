@@ -1,0 +1,283 @@
+name: Docker Images
+
+on:
+  release:
+    types: [published]
+
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建 Docker 镜像的 Release Tag，例如 v0.14.0"
+        required: true
+        type: string
+      push_latest:
+        description: "是否额外推送 latest-scratch / latest-alpine"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  docker:
+    name: Build scratch and alpine images
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+            PUSH_LATEST="${{ github.event.release.prerelease == false }}"
+          else
+            TAG="${{ inputs.tag }}"
+            PUSH_LATEST="${{ inputs.push_latest }}"
+          fi
+
+          IMAGE="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+          VERSION="${TAG#v}"
+
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "image=${IMAGE}"
+            echo "push_latest=${PUSH_LATEST}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "TAG=${TAG}"
+          echo "VERSION=${VERSION}"
+          echo "IMAGE=${IMAGE}"
+          echo "PUSH_LATEST=${PUSH_LATEST}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.vars.outputs.tag }}
+
+      - name: Resolve git revision
+        id: git
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Download release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          mkdir -p docker-context/binaries/amd64
+          mkdir -p docker-context/binaries/arm64
+
+          download_one() {
+            local arch="$1"
+            local target="$2"
+            local asset="meow-${TAG}-${target}.tar.gz"
+            local checksum="${asset}.sha256"
+
+            echo "Downloading ${asset}"
+
+            gh release download "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${asset}" \
+              --dir dist \
+              --clobber
+
+            gh release download "${TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --pattern "${checksum}" \
+              --dir dist \
+              --clobber
+
+            (
+              cd dist
+              sha256sum -c "${checksum}"
+            )
+
+            tar -xzf "dist/${asset}" -C dist
+
+            cp "dist/meow-${TAG}-${target}/meow" "docker-context/binaries/${arch}/meow"
+            chmod +x "docker-context/binaries/${arch}/meow"
+          }
+
+          download_one "amd64" "x86_64-unknown-linux-musl"
+          download_one "arm64" "aarch64-unknown-linux-musl"
+
+          if [[ -f config.example.yaml ]]; then
+            cp config.example.yaml docker-context/config.example.yaml
+          else
+            cat > docker-context/config.example.yaml <<'EOF'
+          # Mount your real config to /etc/meow/config.yaml
+          EOF
+          fi
+
+      - name: Generate Dockerfiles
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > docker-context/Dockerfile.scratch <<'EOF'
+          FROM alpine:3.22 AS certs
+          RUN apk add --no-cache ca-certificates
+
+          FROM scratch
+
+          ARG TARGETARCH
+          ARG VERSION
+          ARG REVISION
+          ARG SOURCE
+
+          LABEL org.opencontainers.image.title="meow-rs"
+          LABEL org.opencontainers.image.description="Minimal scratch image for meow-rs"
+          LABEL org.opencontainers.image.version="${VERSION}"
+          LABEL org.opencontainers.image.revision="${REVISION}"
+          LABEL org.opencontainers.image.source="${SOURCE}"
+          LABEL org.opencontainers.image.variant="scratch"
+
+          COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+          COPY --chmod=0755 binaries/${TARGETARCH}/meow /usr/local/bin/meow
+          COPY config.example.yaml /etc/meow/config.yaml
+
+          EXPOSE 7890/tcp
+          EXPOSE 9090/tcp
+          EXPOSE 1053/udp
+
+          USER 65532:65532
+
+          ENTRYPOINT ["/usr/local/bin/meow"]
+          CMD ["-f", "/etc/meow/config.yaml"]
+          EOF
+
+          cat > docker-context/Dockerfile.alpine <<'EOF'
+          FROM alpine:3.22
+
+          ARG TARGETARCH
+          ARG VERSION
+          ARG REVISION
+          ARG SOURCE
+
+          LABEL org.opencontainers.image.title="meow-rs"
+          LABEL org.opencontainers.image.description="Alpine debug image for meow-rs"
+          LABEL org.opencontainers.image.version="${VERSION}"
+          LABEL org.opencontainers.image.revision="${REVISION}"
+          LABEL org.opencontainers.image.source="${SOURCE}"
+          LABEL org.opencontainers.image.variant="alpine"
+
+          RUN apk add --no-cache ca-certificates tzdata \
+            && addgroup -S meow \
+            && adduser -S -D -H -h /nonexistent -s /sbin/nologin -G meow meow
+
+          COPY --chmod=0755 binaries/${TARGETARCH}/meow /usr/local/bin/meow
+          COPY config.example.yaml /etc/meow/config.yaml
+
+          EXPOSE 7890/tcp
+          EXPOSE 9090/tcp
+          EXPOSE 1053/udp
+
+          USER meow:meow
+
+          ENTRYPOINT ["/usr/local/bin/meow"]
+          CMD ["-f", "/etc/meow/config.yaml"]
+          EOF
+
+      - name: Generate image tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="${{ steps.vars.outputs.image }}"
+          TAG="${{ steps.vars.outputs.tag }}"
+          VERSION="${{ steps.vars.outputs.version }}"
+          PUSH_LATEST="${{ steps.vars.outputs.push_latest }}"
+
+          {
+            echo "scratch<<EOF"
+            echo "${IMAGE}:${TAG}-scratch"
+            echo "${IMAGE}:${VERSION}-scratch"
+            if [[ "${PUSH_LATEST}" == "true" ]]; then
+              echo "${IMAGE}:latest-scratch"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "alpine<<EOF"
+            echo "${IMAGE}:${TAG}-alpine"
+            echo "${IMAGE}:${VERSION}-alpine"
+            if [[ "${PUSH_LATEST}" == "true" ]]; then
+              echo "${IMAGE}:latest-alpine"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push scratch image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-context
+          file: docker-context/Dockerfile.scratch
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.scratch }}
+          build-args: |
+            VERSION=${{ steps.vars.outputs.version }}
+            REVISION=${{ steps.git.outputs.revision }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+          labels: |
+            org.opencontainers.image.title=meow-rs
+            org.opencontainers.image.description=Minimal scratch image for meow-rs
+            org.opencontainers.image.version=${{ steps.vars.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.git.outputs.revision }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.variant=scratch
+          provenance: true
+          sbom: true
+
+      - name: Build and push alpine image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-context
+          file: docker-context/Dockerfile.alpine
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.alpine }}
+          build-args: |
+            VERSION=${{ steps.vars.outputs.version }}
+            REVISION=${{ steps.git.outputs.revision }}
+            SOURCE=${{ github.server_url }}/${{ github.repository }}
+          labels: |
+            org.opencontainers.image.title=meow-rs
+            org.opencontainers.image.description=Alpine debug image for meow-rs
+            org.opencontainers.image.version=${{ steps.vars.outputs.version }}
+            org.opencontainers.image.revision=${{ steps.git.outputs.revision }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.variant=alpine
+          provenance: true
+          sbom: true
