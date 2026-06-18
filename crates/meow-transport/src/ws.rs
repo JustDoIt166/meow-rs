@@ -25,8 +25,8 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use futures_util::{Sink, Stream as FuturesStream};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::WebSocketStream;
 use tracing::warn;
@@ -51,6 +51,11 @@ fn ws_config() -> WebSocketConfig {
 /// Configuration for the WebSocket transport layer.
 #[derive(Debug, Clone)]
 pub struct WsConfig {
+    /// URI authority used in the HTTP request target. This can differ from the
+    /// `Host` header when a proxy config overrides Host explicitly.
+    pub uri_host: Option<String>,
+    /// Whether the outer connection is already TLS-wrapped.
+    pub secure: bool,
     /// HTTP request path for the WebSocket upgrade.  Defaults to `"/"`.
     pub path: String,
     /// Value for the `Host` header.  If also present in
@@ -74,6 +79,8 @@ pub struct WsConfig {
 impl Default for WsConfig {
     fn default() -> Self {
         Self {
+            uri_host: None,
+            secure: false,
             path: "/".into(),
             host_header: None,
             extra_headers: Vec::new(),
@@ -121,7 +128,9 @@ impl WsLayer {
             .host_header
             .as_deref()
             .expect("host_header checked above");
-        let uri = format!("ws://{}{}", host, config.path);
+        let uri_host = config.uri_host.as_deref().unwrap_or(host);
+        let scheme = if config.secure { "wss" } else { "ws" };
+        let uri = format!("{scheme}://{uri_host}{}", config.path);
         let early_header = config
             .early_data_header_name
             .as_deref()
@@ -163,7 +172,9 @@ impl Transport for WsLayer {
             .as_deref()
             .expect("host_header validated at WsLayer::new")
             .to_owned();
-        let uri = format!("ws://{}{}", host, self.config.path);
+        let uri_host = self.config.uri_host.as_deref().unwrap_or(&host);
+        let scheme = if self.config.secure { "wss" } else { "ws" };
+        let uri = format!("{scheme}://{uri_host}{}", self.config.path);
 
         // Strip any Host from extra_headers; we add it explicitly.
         let extra: Vec<(String, String)> = self
@@ -185,10 +196,7 @@ impl Transport for WsLayer {
             // Eager path — no early data.
             let request = build_request(&uri, &host, &extra, "", "")
                 .map_err(|e| TransportError::Config(e.to_string()))?;
-            let (ws, _) =
-                tokio_tungstenite::client_async_with_config(request, inner, Some(ws_config()))
-                    .await
-                    .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+            let ws = client_async_go_style(request, inner, Some(ws_config())).await?;
             Ok(Box::new(WsStream::connected(ws)))
         } else {
             // Deferred path — accumulate early data on first writes.
@@ -233,6 +241,13 @@ fn build_request(
         builder = builder.header(k.as_str(), v.as_str());
     }
 
+    if !extra_headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+    {
+        builder = builder.header("User-Agent", "Go-http-client/1.1");
+    }
+
     if !early_data_value.is_empty() {
         builder = builder.header(early_data_header, early_data_value);
     }
@@ -247,9 +262,8 @@ type BoxStream = Box<dyn Stream>;
 // The upgrade future runs in a spawned task and sends the result back.
 // Using a oneshot channel avoids boxing a non-Sync future while still making
 // WsStream: Sync (oneshot::Receiver<T>: Sync when T: Send).
-type UpgradeRx = tokio::sync::oneshot::Receiver<
-    std::result::Result<WebSocketStream<BoxStream>, tokio_tungstenite::tungstenite::Error>,
->;
+type UpgradeRx =
+    tokio::sync::oneshot::Receiver<std::result::Result<WebSocketStream<BoxStream>, TransportError>>;
 
 struct PendingState {
     inner: Option<BoxStream>,
@@ -332,11 +346,149 @@ fn begin_upgrade(state: &mut PendingState) -> UpgradeRx {
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let result =
-            tokio_tungstenite::client_async_with_config(request, inner, Some(ws_config())).await;
-        let _ = tx.send(result.map(|(ws, _)| ws));
+        let result = client_async_go_style(request, inner, Some(ws_config())).await;
+        let _ = tx.send(result);
     });
     rx
+}
+
+async fn client_async_go_style(
+    request: tokio_tungstenite::tungstenite::http::Request<()>,
+    mut inner: BoxStream,
+    config: Option<WebSocketConfig>,
+) -> Result<WebSocketStream<BoxStream>> {
+    let path = request
+        .uri()
+        .path_and_query()
+        .ok_or_else(|| TransportError::Config("ws: request URI has no path".into()))?
+        .as_str();
+    let headers = request.headers();
+    let host = header_str(headers, "Host")?;
+    let key = header_str(headers, "Sec-WebSocket-Key")?;
+    let version = header_str(headers, "Sec-WebSocket-Version")?;
+    let connection = header_str(headers, "Connection")?;
+    let upgrade = header_str(headers, "Upgrade")?;
+    let user_agent = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("Go-http-client/1.1");
+
+    let mut bytes = Vec::with_capacity(512);
+    bytes.extend_from_slice(format!("GET {path} HTTP/1.1\r\n").as_bytes());
+    bytes.extend_from_slice(format!("Host: {host}\r\n").as_bytes());
+    bytes.extend_from_slice(format!("User-Agent: {user_agent}\r\n").as_bytes());
+
+    for (name, value) in headers {
+        let name = name.as_str();
+        if is_go_style_ws_header(name) || name.eq_ignore_ascii_case("user-agent") {
+            continue;
+        }
+        let value = value
+            .to_str()
+            .map_err(|e| TransportError::Config(format!("ws: invalid header {name}: {e}")))?;
+        bytes.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+
+    bytes.extend_from_slice(format!("Connection: {connection}\r\n").as_bytes());
+    bytes.extend_from_slice(format!("Sec-Websocket-Key: {key}\r\n").as_bytes());
+    bytes.extend_from_slice(format!("Sec-Websocket-Version: {version}\r\n").as_bytes());
+    bytes.extend_from_slice(format!("Upgrade: {upgrade}\r\n\r\n").as_bytes());
+
+    inner
+        .write_all(&bytes)
+        .await
+        .map_err(|e| TransportError::WebSocket(format!("write request: {e}")))?;
+    inner
+        .flush()
+        .await
+        .map_err(|e| TransportError::WebSocket(format!("flush request: {e}")))?;
+
+    read_go_style_response(&mut inner).await?;
+    Ok(WebSocketStream::from_raw_socket(inner, Role::Client, config).await)
+}
+
+fn header_str<'a>(
+    headers: &'a tokio_tungstenite::tungstenite::http::HeaderMap,
+    name: &str,
+) -> Result<&'a str> {
+    headers
+        .get(name)
+        .ok_or_else(|| TransportError::Config(format!("ws: missing header {name}")))?
+        .to_str()
+        .map_err(|e| TransportError::Config(format!("ws: invalid header {name}: {e}")))
+}
+
+fn is_go_style_ws_header(name: &str) -> bool {
+    [
+        "host",
+        "connection",
+        "upgrade",
+        "sec-websocket-version",
+        "sec-websocket-key",
+    ]
+    .iter()
+    .any(|h| name.eq_ignore_ascii_case(h))
+}
+
+async fn read_go_style_response(inner: &mut BoxStream) -> Result<()> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
+    loop {
+        if buf.len() >= 64 * 1024 {
+            return Err(TransportError::WebSocket(
+                "websocket handshake response too large".into(),
+            ));
+        }
+        let n = inner
+            .read(&mut byte)
+            .await
+            .map_err(|e| TransportError::WebSocket(format!("read response: {e}")))?;
+        if n == 0 {
+            return Err(TransportError::WebSocket("websocket handshake EOF".into()));
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let response = std::str::from_utf8(&buf)
+        .map_err(|e| TransportError::WebSocket(format!("bad response utf8: {e}")))?;
+    let mut lines = response.split("\r\n");
+    let status = lines
+        .next()
+        .ok_or_else(|| TransportError::WebSocket("empty response".into()))?;
+    if !status.contains(" 101 ") {
+        let status_text = status.strip_prefix("HTTP/1.1 ").unwrap_or(status);
+        return Err(TransportError::WebSocket(format!(
+            "websocket handshake: HTTP error: {status_text}"
+        )));
+    }
+
+    let mut saw_connection = false;
+    let mut saw_upgrade = false;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("connection")
+            && value
+                .split(',')
+                .any(|v| v.trim().eq_ignore_ascii_case("upgrade"))
+        {
+            saw_connection = true;
+        }
+        if name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket") {
+            saw_upgrade = true;
+        }
+    }
+    if !saw_connection || !saw_upgrade {
+        return Err(TransportError::WebSocket(
+            "websocket handshake: missing upgrade headers".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ─── Poll helpers ─────────────────────────────────────────────────────────────
@@ -566,6 +718,8 @@ mod tests {
 
     fn valid_config() -> WsConfig {
         WsConfig {
+            uri_host: None,
+            secure: false,
             path: "/".into(),
             host_header: Some("example.com".into()),
             extra_headers: Vec::new(),

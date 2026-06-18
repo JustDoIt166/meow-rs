@@ -15,7 +15,7 @@ use meow_common::{
 };
 use meow_transport::{
     tls::{TlsConfig, TlsLayer},
-    Stream as TransportStream, Transport,
+    Stream as TransportStream,
 };
 use sha2::{Digest, Sha224};
 use smol_str::SmolStr;
@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 use crate::stream_conn::StreamConn;
-use crate::transport_to_proxy_err;
+use crate::transport_chain::TransportChain;
 
 /// SOCKS5-style command bytes used inside the Trojan request header.
 const CMD_CONNECT: u8 = 0x01;
@@ -46,7 +46,7 @@ pub struct TrojanAdapter {
     hex_password: SmolStr,
     support_udp: bool,
     health: ProxyHealth,
-    tls_layer: TlsLayer,
+    transport: TransportChain,
 }
 
 impl TrojanAdapter {
@@ -59,11 +59,6 @@ impl TrojanAdapter {
         skip_verify: bool,
         udp: bool,
     ) -> Self {
-        // SHA-224 hash of password, hex-encoded = 56 chars.
-        let mut hasher = Sha224::new();
-        hasher.update(password.as_bytes());
-        let hex_password = hex::encode(hasher.finalize());
-
         // Config resolves effective SNI: explicit sni if set, else server hostname.
         let effective_sni = if sni.is_empty() {
             server.to_string()
@@ -71,13 +66,32 @@ impl TrojanAdapter {
             sni.to_string()
         };
 
-        let tls_config = TlsConfig {
+        let mut tls_config = TlsConfig {
             skip_cert_verify: skip_verify,
             ..TlsConfig::new(effective_sni)
         };
+        tls_config.alpn = vec!["h2".to_string(), "http/1.1".to_string()];
 
         let tls_layer = TlsLayer::new(&tls_config)
             .expect("TrojanAdapter: failed to build TlsLayer — check SNI/cert config");
+        let mut transport = TransportChain::empty();
+        transport.push(Box::new(tls_layer));
+
+        Self::new_with_transport(name, server, port, password, udp, transport)
+    }
+
+    pub fn new_with_transport(
+        name: &str,
+        server: &str,
+        port: u16,
+        password: &str,
+        udp: bool,
+        transport: TransportChain,
+    ) -> Self {
+        // SHA-224 hash of password, hex-encoded = 56 chars.
+        let mut hasher = Sha224::new();
+        hasher.update(password.as_bytes());
+        let hex_password = hex::encode(hasher.finalize());
 
         Self {
             name: SmolStr::from(name),
@@ -87,7 +101,7 @@ impl TrojanAdapter {
             hex_password: SmolStr::from(hex_password),
             support_udp: udp,
             health: ProxyHealth::new(),
-            tls_layer,
+            transport,
         }
     }
 
@@ -111,8 +125,8 @@ impl TrojanAdapter {
         Ok(&out[..pos])
     }
 
-    /// Open a TLS stream and write the Trojan request header.
-    async fn open_tls_with_header(
+    /// Open the configured transport stream and write the Trojan request header.
+    async fn open_transport_with_header(
         &self,
         metadata: &Metadata,
         cmd: u8,
@@ -124,11 +138,7 @@ impl TrojanAdapter {
             .await
             .map_err(MeowError::Io)?;
 
-        let mut stream = self
-            .tls_layer
-            .connect(Box::new(tcp))
-            .await
-            .map_err(transport_to_proxy_err)?;
+        let mut stream = self.transport.connect(Box::new(tcp)).await?;
 
         stream.write_all(header).await.map_err(MeowError::Io)?;
         Ok(stream)
@@ -393,7 +403,9 @@ impl ProxyAdapter for TrojanAdapter {
             metadata.remote_address(),
             self.addr_str
         );
-        let stream = self.open_tls_with_header(metadata, CMD_CONNECT).await?;
+        let stream = self
+            .open_transport_with_header(metadata, CMD_CONNECT)
+            .await?;
         Ok(Box::new(StreamConn(stream)))
     }
 
@@ -409,7 +421,7 @@ impl ProxyAdapter for TrojanAdapter {
             self.addr_str
         );
         let stream = self
-            .open_tls_with_header(metadata, CMD_UDP_ASSOCIATE)
+            .open_transport_with_header(metadata, CMD_UDP_ASSOCIATE)
             .await?;
         Ok(Box::new(TrojanPacketConn::new(stream)))
     }

@@ -3,7 +3,7 @@ use dashmap::DashMap;
 use http_body_util::BodyExt;
 use meow_api::routes::{create_router, AppState};
 use meow_common::DnsMode;
-use meow_config::raw::{RawConfig, RawProxyGroup, RawSubscription};
+use meow_config::raw::{RawConfig, RawProxyGroup, RawProxyProvider, RawSubscription};
 use meow_dns::Resolver;
 use meow_trie::DomainTrie;
 use meow_tunnel::Tunnel;
@@ -58,7 +58,9 @@ fn test_state(raw: RawConfig) -> Arc<AppState> {
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
+        storage: Arc::new(DashMap::new()),
         listeners: vec![],
+        ui_assets: meow_api::ui::UiAssets::built_in(),
     })
 }
 
@@ -92,7 +94,9 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
+        storage: Arc::new(DashMap::new()),
         listeners: vec![],
+        ui_assets: meow_api::ui::UiAssets::built_in(),
     })
 }
 
@@ -137,6 +141,98 @@ async fn ui_wildcard_serves_same_html() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_string(resp).await;
     assert!(body.contains("<!DOCTYPE html>"));
+}
+
+fn test_state_with_ui_assets(raw: RawConfig, ui_assets: meow_api::ui::UiAssets) -> Arc<AppState> {
+    let state = test_state(raw);
+    Arc::new(AppState {
+        tunnel: state.tunnel.clone(),
+        secret: state.secret.clone(),
+        config_path: state.config_path.clone(),
+        raw_config: Arc::clone(&state.raw_config),
+        log_tx: state.log_tx.clone(),
+        proxy_providers: Arc::clone(&state.proxy_providers),
+        rule_providers: Arc::clone(&state.rule_providers),
+        storage: Arc::clone(&state.storage),
+        listeners: state.listeners.clone(),
+        ui_assets,
+    })
+}
+
+#[tokio::test]
+async fn external_ui_serves_asset_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let assets = dir.path().join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("app.js"), "console.log('ok');").unwrap();
+
+    let ui_assets = meow_api::ui::UiAssets::from_config(&meow_config::UiConfig {
+        external: Some(meow_config::ExternalUiConfig {
+            path: dir.path().to_path_buf(),
+            url: "https://example.invalid/ui.zip".to_string(),
+        }),
+    });
+    let state = test_state_with_ui_assets(test_raw_config(), ui_assets);
+    let app = create_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/ui/assets/app.js")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_string(resp).await, "console.log('ok');");
+}
+
+#[tokio::test]
+async fn external_ui_rejects_encoded_parent_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("index.html"), "<!DOCTYPE html>").unwrap();
+    let ui_assets = meow_api::ui::UiAssets::from_config(&meow_config::UiConfig {
+        external: Some(meow_config::ExternalUiConfig {
+            path: dir.path().to_path_buf(),
+            url: "https://example.invalid/ui.zip".to_string(),
+        }),
+    });
+    let state = test_state_with_ui_assets(test_raw_config(), ui_assets);
+    let app = create_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/ui/%2e%2e/secret.txt")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn missing_external_ui_does_not_fallback_to_builtin_html() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing-ui");
+    let ui_assets = meow_api::ui::UiAssets::from_config(&meow_config::UiConfig {
+        external: Some(meow_config::ExternalUiConfig {
+            path: missing,
+            url: "https://example.invalid/ui.zip".to_string(),
+        }),
+    });
+    let state = test_state_with_ui_assets(test_raw_config(), ui_assets);
+    let app = create_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/ui/")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 // ── Existing endpoint tests ──────────────────────────────────────
@@ -189,6 +285,147 @@ async fn get_proxies_contains_builtins() {
     assert!(proxies.contains_key("DIRECT"));
     assert!(proxies.contains_key("REJECT"));
     assert!(proxies.contains_key("REJECT-DROP"));
+}
+
+#[tokio::test]
+async fn get_proxies_adds_global_compat_group_for_dashboard() {
+    let mut raw = test_raw_config();
+    raw.proxy_groups = Some(vec![RawProxyGroup {
+        name: "TestSelector".into(),
+        group_type: "select".into(),
+        proxies: Some(vec!["DIRECT".into(), "REJECT".into()]),
+        ..Default::default()
+    }]);
+    let state = test_state(raw);
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/proxies")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["proxies"]["GLOBAL"]["name"], "GLOBAL");
+    assert_eq!(
+        json["proxies"]["GLOBAL"]["all"],
+        serde_json::json!(["DIRECT", "REJECT", "TestSelector"])
+    );
+}
+
+#[tokio::test]
+async fn get_proxy_global_returns_compat_group_for_dashboard() {
+    let mut raw = test_raw_config();
+    raw.proxy_groups = Some(vec![RawProxyGroup {
+        name: "TestSelector".into(),
+        group_type: "select".into(),
+        proxies: Some(vec!["DIRECT".into(), "REJECT".into()]),
+        ..Default::default()
+    }]);
+    let state = test_state(raw);
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/proxies/GLOBAL")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["name"], "GLOBAL");
+    assert_eq!(
+        json["all"],
+        serde_json::json!(["DIRECT", "REJECT", "TestSelector"])
+    );
+}
+
+#[tokio::test]
+async fn get_proxies_includes_provider_members_as_top_level_entries() {
+    let state = test_state_default();
+    let dir = tempfile::tempdir().unwrap();
+    let provider_path = dir.path().join("provider.yaml");
+    std::fs::write(
+        &provider_path,
+        "proxies:\n  - name: provider-a\n    type: http\n    server: 127.0.0.1\n    port: 8080\n",
+    )
+    .unwrap();
+    let raw_provider = RawProxyProvider {
+        provider_type: "file".to_string(),
+        url: None,
+        path: Some(provider_path.to_string_lossy().to_string()),
+        interval: None,
+        filter: None,
+        exclude_filter: None,
+        exclude_type: None,
+        health_check: None,
+        header: None,
+    };
+    let provider = Arc::new(
+        meow_config::proxy_provider::ProxyProvider::new("sub", &raw_provider, None).unwrap(),
+    );
+    provider.refresh().await;
+    state
+        .proxy_providers
+        .insert("sub".to_string(), Arc::clone(&provider));
+
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/proxies")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let proxies = json["proxies"].as_object().unwrap();
+    assert_eq!(proxies["provider-a"]["name"], "provider-a");
+}
+
+#[tokio::test]
+async fn get_proxy_finds_provider_member() {
+    let state = test_state_default();
+    let dir = tempfile::tempdir().unwrap();
+    let provider_path = dir.path().join("provider.yaml");
+    std::fs::write(
+        &provider_path,
+        "proxies:\n  - name: provider-a\n    type: http\n    server: 127.0.0.1\n    port: 8080\n",
+    )
+    .unwrap();
+    let raw_provider = RawProxyProvider {
+        provider_type: "file".to_string(),
+        url: None,
+        path: Some(provider_path.to_string_lossy().to_string()),
+        interval: None,
+        filter: None,
+        exclude_filter: None,
+        exclude_type: None,
+        health_check: None,
+        header: None,
+    };
+    let provider = Arc::new(
+        meow_config::proxy_provider::ProxyProvider::new("sub", &raw_provider, None).unwrap(),
+    );
+    provider.refresh().await;
+    state.proxy_providers.insert("sub".to_string(), provider);
+
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/proxies/provider-a")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["name"], "provider-a");
 }
 
 #[tokio::test]
@@ -305,6 +542,8 @@ async fn get_traffic() {
     let json = body_json(resp).await;
     assert_eq!(json["up"], 0);
     assert_eq!(json["down"], 0);
+    assert_eq!(json["upTotal"], 0);
+    assert_eq!(json["downTotal"], 0);
 }
 
 #[tokio::test]
@@ -321,9 +560,79 @@ async fn get_connections_empty() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["upload_total"], 0);
-    assert_eq!(json["download_total"], 0);
+    assert_eq!(json["uploadTotal"], 0);
+    assert_eq!(json["downloadTotal"], 0);
     assert!(json["connections"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn storage_missing_key_returns_json_null() {
+    let state = test_state_default();
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/storage/zashboard")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(json.is_null());
+}
+
+#[tokio::test]
+async fn storage_put_get_delete_round_trip() {
+    let state = test_state_default();
+    let app = create_router(Arc::clone(&state));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/storage/zashboard")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"theme":"dark"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let app = create_router(Arc::clone(&state));
+    let resp = app
+        .oneshot(
+            Request::get("/storage/zashboard")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await, serde_json::json!({"theme": "dark"}));
+
+    let app = create_router(Arc::clone(&state));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/storage/zashboard")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/storage/zashboard")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(body_json(resp).await.is_null());
 }
 
 // ── Rules CRUD tests ─────────────────────────────────────────────
@@ -1525,7 +1834,9 @@ mod delay_support {
             log_tx: tokio::sync::broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
+            storage: Arc::new(DashMap::new()),
             listeners: vec![],
+            ui_assets: meow_api::ui::UiAssets::built_in(),
         })
     }
 
@@ -1576,7 +1887,9 @@ mod delay_support {
             log_tx: tokio::sync::broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
+            storage: Arc::new(DashMap::new()),
             listeners: vec![],
+            ui_assets: meow_api::ui::UiAssets::built_in(),
         })
     }
 }
@@ -2370,7 +2683,9 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
         log_tx: test_log_tx(),
         proxy_providers: Arc::new(DashMap::new()),
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
+        storage: Arc::new(DashMap::new()),
         listeners: vec![],
+        ui_assets: meow_api::ui::UiAssets::built_in(),
     })
 }
 

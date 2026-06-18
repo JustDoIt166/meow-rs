@@ -2,7 +2,7 @@ use crate::match_engine::{self, DomainIndex};
 use crate::statistics::Statistics;
 use crate::udp::{self, NatTable};
 use arc_swap::ArcSwap;
-use meow_common::{Metadata, Proxy, ProxyAdapter, Rule, TunnelMode};
+use meow_common::{Metadata, Proxy, ProxyAdapter, Rule, RuntimeRule, TunnelMode};
 use meow_dns::Resolver;
 use meow_proxy::DirectAdapter;
 use parking_lot::RwLock;
@@ -241,6 +241,7 @@ impl Tunnel {
     }
 
     pub fn update_rules(&self, rules: Vec<Box<dyn Rule>>) {
+        let rules: Vec<Box<dyn Rule>> = rules.into_iter().map(RuntimeRule::wrap).collect();
         let needs_ip = rules.iter().any(|r| r.should_resolve_ip());
         let needs_proc = rules.iter().any(|r| r.should_find_process());
         let new_index = DomainIndex::build(&rules);

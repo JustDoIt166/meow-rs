@@ -17,7 +17,10 @@ use tokio::sync::broadcast;
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-fn make_state_with_cap(cap: usize) -> (Arc<AppState>, broadcast::Sender<LogMessage>) {
+fn make_state_with_cap_and_secret(
+    cap: usize,
+    secret: Option<&str>,
+) -> (Arc<AppState>, broadcast::Sender<LogMessage>) {
     let resolver = Arc::new(Resolver::new(
         vec!["8.8.8.8:53".parse().unwrap()],
         vec![],
@@ -35,15 +38,21 @@ fn make_state_with_cap(cap: usize) -> (Arc<AppState>, broadcast::Sender<LogMessa
     let (log_tx, _rx) = broadcast::channel(cap);
     let state = Arc::new(AppState {
         tunnel,
-        secret: None,
+        secret: secret.map(str::to_string),
         config_path,
         raw_config: Arc::new(RwLock::new(raw)),
         log_tx: log_tx.clone(),
         proxy_providers: Arc::new(DashMap::new()),
         rule_providers: Arc::new(RwLock::new(HashMap::new())),
+        storage: Arc::new(DashMap::new()),
         listeners: vec![],
+        ui_assets: meow_api::ui::UiAssets::built_in(),
     });
     (state, log_tx)
+}
+
+fn make_state_with_cap(cap: usize) -> (Arc<AppState>, broadcast::Sender<LogMessage>) {
+    make_state_with_cap_and_secret(cap, None)
 }
 
 fn make_state() -> (Arc<AppState>, broadcast::Sender<LogMessage>) {
@@ -79,6 +88,17 @@ async fn recv_text(ws: &mut WsStream) -> String {
     tokio::time::timeout(Duration::from_millis(500), ws.next())
         .await
         .expect("no WS frame within 500ms")
+        .expect("ws stream ended")
+        .expect("ws recv error")
+        .into_text()
+        .unwrap()
+        .to_string()
+}
+
+async fn recv_text_with_timeout(ws: &mut WsStream, timeout: Duration) -> String {
+    tokio::time::timeout(timeout, ws.next())
+        .await
+        .expect("no WS frame within timeout")
         .expect("ws stream ended")
         .expect("ws recv error")
         .into_text()
@@ -325,6 +345,45 @@ async fn logs_ws_lagged_client_continues() {
         v.get("type").is_some(),
         "post-lag frame must be valid JSON: {text}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn traffic_ws_accepts_query_token_and_emits_totals() {
+    let (state, _log_tx) = make_state_with_cap_and_secret(128, Some("hunter2"));
+    state.tunnel.statistics().add_upload(7);
+    state.tunnel.statistics().add_download(11);
+    let (addr, _handle) = spawn_server(state).await;
+    let mut ws = ws_connect(&format!(
+        "ws://127.0.0.1:{}/traffic?token=hunter2",
+        addr.port()
+    ))
+    .await;
+
+    let text = recv_text_with_timeout(&mut ws, Duration::from_millis(1500)).await;
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(v.get("up").is_some());
+    assert!(v.get("down").is_some());
+    assert!(v.get("upTotal").is_some());
+    assert!(v.get("downTotal").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connections_ws_emits_immediate_and_periodic_snapshots() {
+    let (state, _log_tx) = make_state_with_cap_and_secret(128, Some("hunter2"));
+    let (addr, _handle) = spawn_server(state).await;
+    let mut ws = ws_connect(&format!(
+        "ws://127.0.0.1:{}/connections?interval=100&token=hunter2",
+        addr.port()
+    ))
+    .await;
+
+    let first = recv_text(&mut ws).await;
+    let first_json: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert!(first_json["connections"].as_array().unwrap().is_empty());
+
+    let second = recv_text_with_timeout(&mut ws, Duration::from_millis(500)).await;
+    let second_json: serde_json::Value = serde_json::from_str(&second).unwrap();
+    assert!(second_json["connections"].as_array().unwrap().is_empty());
 }
 
 // ── Registry-path regression (tracing-subscriber layer composition) ──

@@ -153,6 +153,7 @@ fn rebuild_from_raw_includes_builtins() {
     assert!(proxies.contains_key("DIRECT"));
     assert!(proxies.contains_key("REJECT"));
     assert!(proxies.contains_key("REJECT-DROP"));
+    assert!(proxies.contains_key("GLOBAL"));
 }
 
 #[test]
@@ -168,8 +169,8 @@ fn rebuild_from_raw_parses_rules() {
 fn rebuild_from_raw_empty_config() {
     let raw = RawConfig::default();
     let (proxies, rules) = rebuild_from_raw(&raw).unwrap();
-    // Should still have built-in proxies
-    assert_eq!(proxies.len(), 3);
+    // Should still have built-in proxies plus mihomo-compatible GLOBAL.
+    assert_eq!(proxies.len(), 4);
     assert!(rules.is_empty());
 }
 
@@ -196,8 +197,33 @@ fn rebuild_from_raw_with_groups() {
     let (proxies, _rules) = rebuild_from_raw(&raw).unwrap();
     assert!(proxies.contains_key("Select"));
     assert!(proxies.contains_key("Auto"));
-    // 3 built-in + 2 groups
-    assert_eq!(proxies.len(), 5);
+    assert!(proxies.contains_key("GLOBAL"));
+    // 3 built-in + 2 groups + GLOBAL
+    assert_eq!(proxies.len(), 6);
+}
+
+#[test]
+fn rebuild_from_raw_adds_global_selector_members_like_mihomo() {
+    let mut raw = minimal_raw_config();
+    raw.proxy_groups = Some(vec![RawProxyGroup {
+        name: "Select".into(),
+        group_type: "select".into(),
+        proxies: Some(vec!["DIRECT".into(), "REJECT".into()]),
+        ..Default::default()
+    }]);
+
+    let (proxies, _rules) = rebuild_from_raw(&raw).unwrap();
+    let global = proxies.get("GLOBAL").unwrap();
+
+    assert_eq!(
+        global.members().unwrap(),
+        vec![
+            "DIRECT".to_string(),
+            "REJECT".to_string(),
+            "Select".to_string()
+        ]
+    );
+    assert_eq!(global.current().as_deref(), Some("DIRECT"));
 }
 
 #[test]

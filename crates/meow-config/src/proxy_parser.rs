@@ -5,6 +5,8 @@ use meow_common::{
 };
 #[cfg(feature = "ss")]
 use meow_proxy::ShadowsocksAdapter;
+#[cfg(any(feature = "trojan", feature = "vless", feature = "vmess"))]
+use meow_proxy::TransportChain;
 #[cfg(feature = "trojan")]
 use meow_proxy::TrojanAdapter;
 use meow_proxy::{
@@ -12,7 +14,7 @@ use meow_proxy::{
     SelectorGroup, Socks5Adapter, UrlTestGroup,
 };
 #[cfg(feature = "vless")]
-use meow_proxy::{TransportChain, VlessAdapter, VlessFlow};
+use meow_proxy::{VlessAdapter, VlessFlow};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -144,26 +146,7 @@ pub fn parse_proxy(
         }
         #[cfg(feature = "trojan")]
         "trojan" => {
-            let server = config
-                .get("server")
-                .and_then(|v| v.as_str())
-                .ok_or("missing server")?;
-            let port = required_port(config, "trojan")?;
-            let password = config
-                .get("password")
-                .and_then(|v| v.as_str())
-                .ok_or("missing password")?;
-            let sni = config.get("sni").and_then(|v| v.as_str()).unwrap_or("");
-            let skip_verify = config
-                .get("skip-cert-verify")
-                .and_then(serde_yaml::Value::as_bool)
-                .unwrap_or(false);
-            let udp = config
-                .get("udp")
-                .and_then(serde_yaml::Value::as_bool)
-                .unwrap_or(false);
-
-            let adapter = TrojanAdapter::new(name, server, port, password, sni, skip_verify, udp);
+            let adapter = parse_trojan(name, config)?;
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         #[cfg(feature = "vless")]
@@ -204,6 +187,169 @@ pub fn parse_proxy(
             Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
         }
         _ => Err(format!("unsupported proxy type: {proxy_type}")),
+    }
+}
+
+#[cfg(feature = "trojan")]
+fn parse_trojan(
+    name: &str,
+    config: &HashMap<String, serde_yaml::Value>,
+) -> std::result::Result<TrojanAdapter, String> {
+    let server = config
+        .get("server")
+        .and_then(|v| v.as_str())
+        .ok_or("missing server")?;
+    let port = required_port(config, "trojan")?;
+    let password = config
+        .get("password")
+        .and_then(|v| v.as_str())
+        .ok_or("missing password")?;
+    let sni = config.get("sni").and_then(|v| v.as_str()).unwrap_or("");
+    let skip_verify = config
+        .get("skip-cert-verify")
+        .and_then(serde_yaml::Value::as_bool)
+        .unwrap_or(false);
+    let udp = config
+        .get("udp")
+        .and_then(serde_yaml::Value::as_bool)
+        .unwrap_or(false);
+    let network = config
+        .get("network")
+        .and_then(|v| v.as_str())
+        .unwrap_or("tcp");
+    let alpn = yaml_string_vec(config.get("alpn"));
+    let client_fingerprint = config
+        .get("client-fingerprint")
+        .or_else(|| config.get("fingerprint"))
+        .and_then(|v| v.as_str())
+        .or(if network == "ws" {
+            Some("chrome")
+        } else {
+            None
+        });
+
+    let effective_sni = if sni.is_empty() {
+        server.to_string()
+    } else {
+        sni.to_string()
+    };
+
+    let mut chain = TransportChain::empty();
+    {
+        use meow_transport::tls::{TlsConfig, TlsLayer};
+        let mut tls_cfg = TlsConfig::new(effective_sni.clone());
+        tls_cfg.skip_cert_verify = skip_verify;
+        tls_cfg.alpn = if !alpn.is_empty() {
+            alpn
+        } else if network == "ws" {
+            vec!["http/1.1".to_string()]
+        } else {
+            vec!["h2".to_string(), "http/1.1".to_string()]
+        };
+        tls_cfg.fingerprint = client_fingerprint.map(std::string::ToString::to_string);
+        let tls_layer =
+            TlsLayer::new(&tls_cfg).map_err(|e| format!("trojan: TLS layer error: {e}"))?;
+        chain.push(Box::new(tls_layer));
+    }
+
+    match network {
+        "tcp" => {}
+        "ws" => {
+            use meow_transport::ws::{WsConfig, WsLayer};
+            let ws_opts = config.get("ws-opts");
+            let path = ws_opts
+                .and_then(|o| o.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("/")
+                .to_string();
+            let headers = ws_opts.and_then(|o| o.get("headers"));
+            let host_header = yaml_header_value(headers, "host")
+                .map_or_else(|| effective_sni.clone(), std::string::ToString::to_string);
+            let max_early_data = ws_opts
+                .and_then(|o| o.get("max-early-data"))
+                .and_then(serde_yaml::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let early_data_header_name = ws_opts
+                .and_then(|o| o.get("early-data-header-name"))
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string);
+            let extra_headers = yaml_extra_headers_except(headers, "host");
+            let ws_cfg = WsConfig {
+                uri_host: Some(ws_uri_host(&effective_sni, port)),
+                secure: true,
+                path,
+                host_header: Some(host_header),
+                extra_headers,
+                max_early_data,
+                early_data_header_name,
+            };
+            let ws_layer =
+                WsLayer::new(ws_cfg).map_err(|e| format!("trojan: ws layer error: {e}"))?;
+            chain.push(Box::new(ws_layer));
+        }
+        other => {
+            return Err(format!(
+                "trojan: unsupported network '{other}'; valid values: tcp, ws"
+            ));
+        }
+    }
+
+    Ok(TrojanAdapter::new_with_transport(
+        name, server, port, password, udp, chain,
+    ))
+}
+
+#[cfg(feature = "trojan")]
+fn yaml_string_vec(value: Option<&serde_yaml::Value>) -> Vec<String> {
+    match value {
+        Some(serde_yaml::Value::Sequence(seq)) => seq
+            .iter()
+            .filter_map(|v| v.as_str().map(std::string::ToString::to_string))
+            .collect(),
+        Some(serde_yaml::Value::String(s)) => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(feature = "trojan")]
+fn yaml_header_value<'a>(headers: Option<&'a serde_yaml::Value>, key: &str) -> Option<&'a str> {
+    let serde_yaml::Value::Mapping(map) = headers? else {
+        return None;
+    };
+    map.iter().find_map(|(k, v)| {
+        let k = k.as_str()?;
+        if k.eq_ignore_ascii_case(key) {
+            v.as_str()
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(feature = "trojan")]
+fn yaml_extra_headers_except(
+    headers: Option<&serde_yaml::Value>,
+    excluded_key: &str,
+) -> Vec<(String, String)> {
+    let Some(serde_yaml::Value::Mapping(map)) = headers else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(k, v)| {
+            let key = k.as_str()?;
+            if key.eq_ignore_ascii_case(excluded_key) {
+                return None;
+            }
+            Some((key.to_string(), v.as_str()?.to_string()))
+        })
+        .collect()
+}
+
+fn ws_uri_host(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -1214,6 +1360,8 @@ fn parse_vless(
                 .and_then(|v| v.as_str())
                 .map(std::string::ToString::to_string);
             let ws_cfg = WsConfig {
+                uri_host: Some(ws_uri_host(&host_header, port)),
+                secure: tls,
                 path,
                 host_header: Some(host_header),
                 extra_headers: vec![],
@@ -1589,6 +1737,8 @@ fn parse_vmess(
                 .and_then(|v| v.as_str())
                 .map(std::string::ToString::to_string);
             let ws_cfg = WsConfig {
+                uri_host: Some(ws_uri_host(&host_header, port)),
+                secure: tls,
                 path,
                 host_header: Some(host_header),
                 extra_headers: vec![],
@@ -1837,6 +1987,28 @@ mod tests {
             panic!("zero port must hard-error");
         };
         assert!(err.contains("port must be non-zero"), "msg: {err}");
+    }
+
+    #[cfg(feature = "trojan")]
+    #[test]
+    fn parse_trojan_ws_builds_transport_chain_with_lowercase_host_header() {
+        let cfg = proxy_config(
+            r#"
+name: sg-443-Trojan-WS-TLS2
+type: trojan
+server: 162.159.22.192
+port: 443
+password: ba209999-0c6c-11d2-97cf-00c04f8eea45
+sni: sub.dnspodcheck.ip-dynamic.org
+network: ws
+ws-opts:
+  path: /?ed=2048
+  headers:
+    host: sub.dnspodcheck.ip-dynamic.org
+skip-cert-verify: true
+"#,
+        );
+        assert!(parse_proxy(&cfg).is_ok());
     }
 
     #[cfg(feature = "ss")]

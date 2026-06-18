@@ -150,9 +150,37 @@ fn main() -> Result<()> {
 
 fn handle_service_command(cmd: &Command, args: &Args) -> Result<()> {
     match cmd {
-        Command::Install { config } => install_service(config.as_deref(), args),
-        Command::Uninstall => uninstall_service(),
-        Command::Status => service_status(),
+        Command::Install { config } => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                install_service(config.as_deref(), args)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                let _ = (config, args);
+                anyhow::bail!("service install is only supported on Linux and macOS")
+            }
+        }
+        Command::Uninstall => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                uninstall_service()
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                anyhow::bail!("service uninstall is only supported on Linux and macOS")
+            }
+        }
+        Command::Status => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                service_status()
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                anyhow::bail!("service status is only supported on Linux and macOS")
+            }
+        }
     }
 }
 
@@ -519,6 +547,7 @@ async fn run(
             Arc::clone(&proxy_providers),
             Arc::clone(&rule_providers),
             config.listeners.named.clone(),
+            config.api.ui.clone(),
         );
         tokio::spawn(async move {
             if let Err(e) = api_server.run().await {
@@ -653,11 +682,19 @@ async fn run(
 
     info!("meow-rs is running");
 
-    // Wait for shutdown signal (SIGINT or SIGTERM)
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {},
-        _ = sigterm.recv() => {},
+    // Wait for shutdown signal (SIGINT, plus SIGTERM on Unix).
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
     }
     info!("Shutting down...");
 

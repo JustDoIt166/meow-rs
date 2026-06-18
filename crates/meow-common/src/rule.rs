@@ -1,6 +1,7 @@
 use crate::metadata::Metadata;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RuleType {
@@ -128,6 +129,10 @@ pub trait Rule: Send + Sync {
     fn should_find_process(&self) -> bool {
         false
     }
+    fn set_disabled(&self, _disabled: bool) {}
+    fn is_disabled(&self) -> bool {
+        false
+    }
 
     /// Match against metadata and, on match, return the routing target.
     ///
@@ -154,6 +159,66 @@ pub trait Rule: Send + Sync {
             Some(self.adapter())
         } else {
             None
+        }
+    }
+}
+
+pub struct RuntimeRule {
+    inner: Box<dyn Rule>,
+    disabled: AtomicBool,
+}
+
+impl RuntimeRule {
+    pub fn wrap(inner: Box<dyn Rule>) -> Box<dyn Rule> {
+        Box::new(Self {
+            inner,
+            disabled: AtomicBool::new(false),
+        })
+    }
+}
+
+impl Rule for RuntimeRule {
+    fn rule_type(&self) -> RuleType {
+        self.inner.rule_type()
+    }
+
+    fn match_metadata(&self, metadata: &Metadata, helper: &RuleMatchHelper) -> bool {
+        !self.is_disabled() && self.inner.match_metadata(metadata, helper)
+    }
+
+    fn adapter(&self) -> &str {
+        self.inner.adapter()
+    }
+
+    fn payload(&self) -> &str {
+        self.inner.payload()
+    }
+
+    fn should_resolve_ip(&self) -> bool {
+        self.inner.should_resolve_ip()
+    }
+
+    fn should_find_process(&self) -> bool {
+        self.inner.should_find_process()
+    }
+
+    fn set_disabled(&self, disabled: bool) {
+        self.disabled.store(disabled, Ordering::Relaxed);
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Relaxed)
+    }
+
+    fn match_and_resolve<'a>(
+        &'a self,
+        metadata: &Metadata,
+        helper: &RuleMatchHelper,
+    ) -> Option<&'a str> {
+        if self.is_disabled() {
+            None
+        } else {
+            self.inner.match_and_resolve(metadata, helper)
         }
     }
 }

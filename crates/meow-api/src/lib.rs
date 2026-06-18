@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use log_stream::LogMessage;
 use meow_config::{
     proxy_provider::ProxyProvider, raw::RawConfig, rule_provider::RuleProvider, NamedListener,
+    UiConfig,
 };
 use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
@@ -25,6 +26,7 @@ pub struct ApiServer {
     proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
     rule_providers: Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
     listeners: Vec<NamedListener>,
+    ui_config: UiConfig,
 }
 
 impl ApiServer {
@@ -39,6 +41,7 @@ impl ApiServer {
         proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
         rule_providers: Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
         listeners: Vec<NamedListener>,
+        ui_config: UiConfig,
     ) -> Self {
         Self {
             tunnel,
@@ -50,10 +53,14 @@ impl ApiServer {
             proxy_providers,
             rule_providers,
             listeners,
+            ui_config,
         }
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let ui_assets = ui::UiAssets::from_config(&self.ui_config);
+        ui_assets.auto_download_if_empty().await;
+
         let state = Arc::new(routes::AppState {
             tunnel: self.tunnel.clone(),
             secret: self.secret.clone(),
@@ -62,7 +69,9 @@ impl ApiServer {
             log_tx: self.log_tx.clone(),
             proxy_providers: Arc::clone(&self.proxy_providers),
             rule_providers: Arc::clone(&self.rule_providers),
+            storage: Arc::new(DashMap::new()),
             listeners: self.listeners.clone(),
+            ui_assets,
         });
 
         let app = routes::create_router(state);

@@ -1,6 +1,7 @@
 use axum::{
+    body::Bytes,
     extract::ws::{Message, WebSocketUpgrade},
-    extract::{Path, Query, Request, State},
+    extract::{FromRequestParts, Path, Query, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
@@ -27,7 +28,7 @@ use tower_http::cors::CorsLayer;
 use tracing::{debug, info};
 
 use crate::log_stream::{parse_log_level, LogMessage};
-use crate::ui;
+use crate::ui::{self, UiAssets};
 
 pub struct AppState {
     pub tunnel: Tunnel,
@@ -40,8 +41,10 @@ pub struct AppState {
     /// Live proxy-provider registry — refreshed by background task and PUT endpoint.
     pub proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
     pub rule_providers: Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
+    pub storage: Arc<DashMap<String, serde_json::Value>>,
     /// Snapshot of active named listeners (read-only, startup-time only in M1).
     pub listeners: Vec<NamedListener>,
+    pub ui_assets: UiAssets,
 }
 
 impl AppState {
@@ -70,7 +73,8 @@ async fn require_auth(State(state): State<Arc<AppState>>, req: Request, next: Ne
         .and_then(|v| {
             v.strip_prefix("Bearer ")
                 .or_else(|| v.strip_prefix("bearer "))
-        });
+        })
+        .or_else(|| websocket_token_param(&req));
 
     // Constant-time comparison so a byte-by-byte attacker cannot distinguish
     // "first N bytes matched" from "failed immediately". Length still leaks;
@@ -87,6 +91,22 @@ async fn require_auth(State(state): State<Arc<AppState>>, req: Request, next: Ne
     } else {
         (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
     }
+}
+
+fn websocket_token_param(req: &Request) -> Option<&str> {
+    let is_websocket = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    if !is_websocket {
+        return None;
+    }
+
+    req.uri().query()?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "token").then_some(value)
+    })
 }
 
 /// Auth middleware for WebSocket upgrade routes. Accepts `Authorization: Bearer <secret>`
@@ -146,11 +166,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/proxies", get(get_proxies))
         .route("/proxies/{name}", get(get_proxy).put(update_proxy))
         .route("/proxies/{name}/delay", get(get_proxy_delay))
+        .route("/group", get(get_groups))
+        .route("/group/{name}", get(get_group))
         .route("/group/{name}/delay", get(get_group_delay))
         .route(
             "/rules",
-            get(get_rules).post(replace_rules).put(update_rule_at_index),
+            get(get_rules)
+                .post(replace_rules)
+                .put(update_rule_at_index)
+                .patch(disable_rules),
         )
+        .route("/rules/disable", axum::routing::patch(disable_rules))
         .route("/rules/{index}", delete(delete_rule))
         .route("/rules/reorder", post(reorder_rules))
         .route("/connections", get(get_connections))
@@ -165,6 +191,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/dns/query", get(dns_query_get).post(dns_query))
         .route("/cache/dns/flush", post(flush_dns_cache))
         .route("/cache/fakeip/flush", post(flush_fakeip_cache))
+        .route(
+            "/storage/{key}",
+            get(get_storage).put(put_storage).delete(delete_storage),
+        )
         // Config save
         .route("/api/config/save", post(save_config))
         // Subscriptions
@@ -200,6 +230,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/providers/proxies/{name}/healthcheck",
             get(provider_healthcheck),
         )
+        .route(
+            "/providers/proxies/{provider_name}/{name}",
+            get(get_provider_proxy),
+        )
+        .route(
+            "/providers/proxies/{provider_name}/{name}/healthcheck",
+            get(get_provider_proxy_healthcheck),
+        )
         // Rule providers
         .route("/providers/rules", get(get_rule_providers))
         .route(
@@ -208,6 +246,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         // Listeners (read-only list)
         .route("/listeners", get(get_listeners))
+        .route("/upgrade/ui", post(upgrade_ui))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_auth,
@@ -216,8 +255,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     // Web UI is intentionally unauthenticated so dashboards can load and then
     // present a token prompt; this matches upstream mihomo behaviour.
     let ui = Router::new()
-        .route("/ui", get(ui::serve_ui))
-        .route("/ui/{*rest}", get(ui::serve_ui));
+        .route("/ui", get(ui::serve_ui_root))
+        .route("/ui/", get(ui::serve_ui_index))
+        .route("/ui/{*rest}", get(ui::serve_ui_path));
 
     api.merge(ws_routes)
         .merge(ui)
@@ -294,6 +334,14 @@ async fn get_proxies(State(state): State<Arc<AppState>>) -> Json<ProxiesResponse
     for (name, proxy) in &route.proxies {
         result.insert(name.to_string(), ProxyInfo::from_proxy(proxy));
     }
+    drop(route);
+
+    for entry in state.proxy_providers.iter() {
+        for proxy in entry.value().proxies() {
+            result.insert(proxy.name().to_string(), ProxyInfo::from_proxy(&proxy));
+        }
+    }
+
     Json(ProxiesResponse { proxies: result })
 }
 
@@ -301,12 +349,51 @@ async fn get_proxy(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<Json<ProxyInfo>, StatusCode> {
+    let proxy = find_proxy(&state, &name).ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(ProxyInfo::from_proxy(&proxy)))
+}
+
+async fn get_groups(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let route = state.tunnel.route_snapshot();
-    let proxy = route
+    let groups: Vec<ProxyInfo> = route
         .proxies
-        .get(name.as_str())
-        .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(ProxyInfo::from_proxy(proxy)))
+        .values()
+        .filter(|proxy| proxy.members().is_some())
+        .map(ProxyInfo::from_proxy)
+        .collect();
+    Json(serde_json::json!({ "proxies": groups }))
+}
+
+async fn get_group(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    let route = state.tunnel.route_snapshot();
+    let Some(proxy) = route.proxies.get(name.as_str()) else {
+        return msg_err(StatusCode::NOT_FOUND, "resource not found");
+    };
+    if proxy.members().is_none() {
+        return msg_err(StatusCode::NOT_FOUND, "resource not found");
+    }
+    Json(ProxyInfo::from_proxy(proxy)).into_response()
+}
+
+fn find_proxy(state: &AppState, name: &str) -> Option<Arc<dyn meow_common::Proxy>> {
+    let route = state.tunnel.route_snapshot();
+    if let Some(proxy) = route.proxies.get(name).cloned() {
+        return Some(proxy);
+    }
+    drop(route);
+
+    for entry in state.proxy_providers.iter() {
+        if let Some(proxy) = entry
+            .value()
+            .proxies()
+            .into_iter()
+            .find(|proxy| proxy.name() == name)
+        {
+            return Some(proxy);
+        }
+    }
+
+    None
 }
 
 #[derive(Deserialize)]
@@ -338,10 +425,23 @@ async fn update_proxy(
 
 #[derive(Serialize)]
 struct RuleInfo<'a> {
+    index: usize,
     #[serde(rename = "type")]
     rule_type: &'static str,
     payload: &'a str,
     proxy: &'a str,
+    size: i32,
+    extra: RuleExtra,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuleExtra {
+    disabled: bool,
+    hit_count: u64,
+    hit_at: Option<u64>,
+    miss_count: u64,
+    miss_at: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -356,10 +456,20 @@ async fn get_rules(State(state): State<Arc<AppState>>) -> Response {
     let result: Vec<RuleInfo> = route
         .rules
         .iter()
-        .map(|r| RuleInfo {
+        .enumerate()
+        .map(|(index, r)| RuleInfo {
+            index,
             rule_type: r.rule_type().as_str(),
             payload: r.payload(),
             proxy: r.adapter(),
+            size: -1,
+            extra: RuleExtra {
+                disabled: r.is_disabled(),
+                hit_count: 0,
+                hit_at: None,
+                miss_count: 0,
+                miss_at: None,
+            },
         })
         .collect();
     Json(RulesResponse { rules: result }).into_response()
@@ -367,7 +477,9 @@ async fn get_rules(State(state): State<Arc<AppState>>) -> Response {
 
 #[derive(Serialize)]
 struct ConnectionsResponse<'a> {
+    #[serde(rename = "uploadTotal")]
     upload_total: i64,
+    #[serde(rename = "downloadTotal")]
     download_total: i64,
     /// Serialised straight from the live table — no per-connection
     /// `serde_json::Value` tree, no cloned snapshot Vec (audit M8). The
@@ -376,7 +488,60 @@ struct ConnectionsResponse<'a> {
     connections: meow_tunnel::statistics::ActiveConnectionsView<'a>,
 }
 
-async fn get_connections(State(state): State<Arc<AppState>>) -> Response {
+async fn get_connections(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    if !is_websocket_request(&req) {
+        return connection_snapshot_response(&state).into_response();
+    }
+
+    let interval_ms = parse_connections_interval(&req).unwrap_or(1000).max(1);
+    let ws = match websocket_upgrade_from_request(req).await {
+        Ok(ws) => ws,
+        Err(resp) => return resp,
+    };
+    ws.on_upgrade(move |mut socket| async move {
+        if send_connections_snapshot(&mut socket, &state)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let mut tick = tokio::time::interval(Duration::from_millis(interval_ms));
+        loop {
+            tick.tick().await;
+            if send_connections_snapshot(&mut socket, &state)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+async fn websocket_upgrade_from_request(req: Request) -> Result<WebSocketUpgrade, Response> {
+    let (mut parts, _body) = req.into_parts();
+    WebSocketUpgrade::from_request_parts(&mut parts, &())
+        .await
+        .map_err(IntoResponse::into_response)
+}
+
+fn is_websocket_request(req: &Request) -> bool {
+    req.headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+}
+
+fn parse_connections_interval(req: &Request) -> Option<u64> {
+    req.uri().query()?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "interval")
+            .then(|| value.parse::<u64>().ok())
+            .flatten()
+    })
+}
+
+fn connection_snapshot_response(state: &AppState) -> Json<ConnectionsResponse<'_>> {
     let stats = state.tunnel.statistics();
     let (up, down) = stats.snapshot();
     Json(ConnectionsResponse {
@@ -384,7 +549,14 @@ async fn get_connections(State(state): State<Arc<AppState>>) -> Response {
         download_total: down,
         connections: stats.active_connections_view(),
     })
-    .into_response()
+}
+
+async fn send_connections_snapshot(
+    socket: &mut axum::extract::ws::WebSocket,
+    state: &AppState,
+) -> Result<(), axum::Error> {
+    let json = serde_json::to_string(&connection_snapshot_response(state).0).unwrap_or_default();
+    socket.send(Message::Text(json.into())).await
 }
 
 async fn close_connection(
@@ -402,31 +574,97 @@ async fn close_connection(
 
 #[derive(Serialize)]
 struct ConfigResponse {
+    port: u16,
+    #[serde(rename = "socks-port")]
+    socks_port: u16,
+    #[serde(rename = "mixed-port")]
+    mixed_port: u16,
+    #[serde(rename = "redir-port")]
+    redir_port: u16,
+    #[serde(rename = "tproxy-port")]
+    tproxy_port: u16,
+    #[serde(rename = "allow-lan")]
+    allow_lan: bool,
+    #[serde(rename = "bind-address")]
+    bind_address: String,
     mode: String,
     #[serde(rename = "log-level")]
     log_level: String,
-    #[serde(rename = "mixed-port", skip_serializing_if = "Option::is_none")]
-    mixed_port: Option<u16>,
-    #[serde(rename = "socks-port", skip_serializing_if = "Option::is_none")]
-    socks_port: Option<u16>,
-    #[serde(rename = "port", skip_serializing_if = "Option::is_none")]
-    http_port: Option<u16>,
-    #[serde(
-        rename = "external-controller",
-        skip_serializing_if = "Option::is_none"
-    )]
-    external_controller: Option<String>,
+    ipv6: bool,
+    sniffing: bool,
+    #[serde(rename = "tcp-concurrent")]
+    tcp_concurrent: bool,
+    #[serde(rename = "geodata-mode")]
+    geodata_mode: bool,
+    #[serde(rename = "geodata-loader")]
+    geodata_loader: String,
+    #[serde(rename = "geo-auto-update")]
+    geo_auto_update: bool,
+    #[serde(rename = "geo-update-interval")]
+    geo_update_interval: u32,
+    #[serde(rename = "external-controller")]
+    external_controller: String,
+    secret: String,
+    #[serde(rename = "unified-delay")]
+    unified_delay: bool,
+    #[serde(rename = "tcp-fack")]
+    tcp_fack: bool,
+    #[serde(rename = "external-ui-name")]
+    external_ui_name: String,
+    #[serde(rename = "external-ui-url")]
+    external_ui_url: String,
 }
 
 async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse> {
     let raw = state.raw_config.read();
+    let geodata = raw.geodata.as_ref();
     Json(ConfigResponse {
+        port: raw.port.unwrap_or_default(),
+        socks_port: raw.socks_port.unwrap_or_default(),
+        mixed_port: raw.mixed_port.unwrap_or_default(),
+        redir_port: raw.redir_port.unwrap_or_default(),
+        tproxy_port: raw.tproxy_port.unwrap_or_default(),
+        allow_lan: raw.allow_lan.unwrap_or(false),
+        bind_address: raw.bind_address.clone().unwrap_or_else(|| "*".to_string()),
         mode: state.tunnel.mode().to_string(),
-        log_level: "info".to_string(),
-        mixed_port: raw.mixed_port,
-        socks_port: raw.socks_port,
-        http_port: raw.port,
-        external_controller: raw.external_controller.clone(),
+        log_level: raw.log_level.clone().unwrap_or_else(|| "info".to_string()),
+        ipv6: raw.ipv6.unwrap_or(false),
+        sniffing: raw
+            .sniffer
+            .as_ref()
+            .and_then(|sniffer| sniffer.enable)
+            .unwrap_or(false),
+        tcp_concurrent: raw.tcp_concurrent.unwrap_or(false),
+        geodata_mode: raw
+            .geodata_mode
+            .as_ref()
+            .or_else(|| geodata.and_then(|g| g.geodata_mode.as_ref()))
+            .and_then(serde_yaml::Value::as_bool)
+            .unwrap_or(false),
+        geodata_loader: raw
+            .geodata_loader
+            .as_ref()
+            .or_else(|| geodata.and_then(|g| g.geodata_loader.as_ref()))
+            .and_then(serde_yaml::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        geo_auto_update: raw
+            .geo_auto_update
+            .unwrap_or_else(|| geodata.is_some_and(|g| g.auto_update)),
+        geo_update_interval: raw
+            .geo_update_interval
+            .or_else(|| geodata.and_then(|g| g.auto_update_interval))
+            .unwrap_or_default(),
+        external_controller: raw.external_controller.clone().unwrap_or_default(),
+        secret: raw
+            .secret
+            .clone()
+            .or_else(|| state.secret.clone())
+            .unwrap_or_default(),
+        unified_delay: raw.unified_delay.unwrap_or(false),
+        tcp_fack: raw.tcp_fack.unwrap_or(false),
+        external_ui_name: raw.external_ui_name.clone().unwrap_or_default(),
+        external_ui_url: raw.external_ui_url.clone().unwrap_or_default(),
     })
 }
 
@@ -458,11 +696,58 @@ async fn update_configs(
 struct TrafficResponse {
     up: i64,
     down: i64,
+    #[serde(rename = "upTotal")]
+    up_total: i64,
+    #[serde(rename = "downTotal")]
+    down_total: i64,
 }
 
-async fn get_traffic(State(state): State<Arc<AppState>>) -> Json<TrafficResponse> {
-    let (up, down) = state.tunnel.statistics().snapshot();
-    Json(TrafficResponse { up, down })
+async fn get_traffic(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    if !is_websocket_request(&req) {
+        let (up, down) = state.tunnel.statistics().snapshot();
+        return Json(TrafficResponse {
+            up,
+            down,
+            up_total: up,
+            down_total: down,
+        })
+        .into_response();
+    }
+
+    let ws = match websocket_upgrade_from_request(req).await {
+        Ok(ws) => ws,
+        Err(resp) => return resp,
+    };
+    ws.on_upgrade(move |mut socket| async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let stats = state.tunnel.statistics();
+        let (mut prev_up, mut prev_down) = stats.snapshot();
+        loop {
+            tick.tick().await;
+            let (up_total, down_total) = stats.snapshot();
+            let frame = TrafficWsFrame {
+                up: up_total.saturating_sub(prev_up),
+                down: down_total.saturating_sub(prev_down),
+                up_total,
+                down_total,
+            };
+            prev_up = up_total;
+            prev_down = down_total;
+            let json = serde_json::to_string(&frame).unwrap_or_default();
+            if socket.send(Message::Text(json.into())).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrafficWsFrame {
+    up: i64,
+    down: i64,
+    up_total: i64,
+    down_total: i64,
 }
 
 #[derive(Deserialize)]
@@ -513,9 +798,57 @@ async fn flush_fakeip_cache(
     }
 }
 
+const STORAGE_MAX_BYTES: usize = 1024 * 1024;
+
+async fn get_storage(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+) -> Json<serde_json::Value> {
+    let value = state
+        .storage
+        .get(&key)
+        .map(|v| v.clone())
+        .unwrap_or(serde_json::Value::Null);
+    Json(value)
+}
+
+async fn put_storage(
+    State(state): State<Arc<AppState>>,
+    Path(key): Path<String>,
+    body: Bytes,
+) -> Response {
+    if body.len() > STORAGE_MAX_BYTES {
+        return msg_err(StatusCode::PAYLOAD_TOO_LARGE, "Body too large");
+    }
+
+    match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(value) => {
+            state.storage.insert(key, value);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(_) => msg_err(StatusCode::BAD_REQUEST, "Body invalid"),
+    }
+}
+
+async fn delete_storage(State(state): State<Arc<AppState>>, Path(key): Path<String>) -> StatusCode {
+    state.storage.remove(&key);
+    StatusCode::NO_CONTENT
+}
+
 async fn close_all_connections(State(state): State<Arc<AppState>>) -> StatusCode {
     state.tunnel.statistics().close_all_connections();
     StatusCode::NO_CONTENT
+}
+
+async fn upgrade_ui(State(state): State<Arc<AppState>>) -> Response {
+    match state.ui_assets.upgrade().await {
+        Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 // ── Config save ──────────────────────────────────────────────────────
@@ -907,6 +1240,23 @@ async fn replace_rules(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn disable_rules(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<HashMap<usize, bool>>,
+) -> StatusCode {
+    if body.is_empty() {
+        return StatusCode::NO_CONTENT;
+    }
+
+    let route = state.tunnel.route_snapshot();
+    for (index, disabled) in body {
+        if let Some(rule) = route.rules.get(index) {
+            rule.set_disabled(disabled);
+        }
+    }
+    StatusCode::NO_CONTENT
+}
+
 #[derive(Deserialize)]
 struct UpdateRuleRequest {
     index: usize,
@@ -1046,12 +1396,10 @@ async fn get_proxy_delay(
     let url = params.url.as_deref().unwrap_or("").to_string();
     let expected = params.expected.clone();
 
-    let route = state.tunnel.route_snapshot();
     // upstream: hub/route/proxies.go::getProxyDelay — findProxyByName middleware
-    let Some(proxy) = route.proxies.get(name.as_str()).cloned() else {
+    let Some(proxy) = find_proxy(&state, &name) else {
         return msg_err(StatusCode::NOT_FOUND, "resource not found");
     };
-    drop(route);
 
     match probe_and_record(&proxy, &url, expected.as_deref(), timeout).await {
         Ok(delay) => Json(DelayResp { delay }).into_response(),
@@ -1090,11 +1438,13 @@ async fn get_group_delay(
 
     // Resolve each member name to an `Arc<dyn Proxy>` *before* dropping the
     // proxies map so the spawned tasks hold their own Arc clones.
+    let member_names: Vec<String> = member_names.into_iter().collect();
+    drop(route);
+
     let members: Vec<(String, Arc<dyn meow_common::Proxy>)> = member_names
         .into_iter()
-        .filter_map(|n| route.proxies.get(n.as_str()).cloned().map(|p| (n, p)))
+        .filter_map(|n| find_proxy(&state, &n).map(|p| (n, p)))
         .collect();
-    drop(route);
 
     let url_shared = Arc::new(url);
     let expected_shared = Arc::new(expected);
@@ -1558,6 +1908,29 @@ async fn get_provider(State(state): State<Arc<AppState>>, Path(name): Path<Strin
     }
 }
 
+fn find_provider_proxy(
+    state: &AppState,
+    provider_name: &str,
+    proxy_name: &str,
+) -> Option<Arc<dyn meow_common::Proxy>> {
+    state
+        .proxy_providers
+        .get(provider_name)?
+        .proxies()
+        .into_iter()
+        .find(|proxy| proxy.name() == proxy_name)
+}
+
+async fn get_provider_proxy(
+    State(state): State<Arc<AppState>>,
+    Path((provider_name, name)): Path<(String, String)>,
+) -> Response {
+    match find_provider_proxy(&state, &provider_name, &name) {
+        Some(proxy) => Json(ProxyInfo::from_proxy(&proxy)).into_response(),
+        None => msg_err(StatusCode::NOT_FOUND, "resource not found"),
+    }
+}
+
 async fn refresh_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -1610,6 +1983,34 @@ async fn provider_healthcheck(
     }
 
     Json(serde_json::Value::Object(results)).into_response()
+}
+
+async fn get_provider_proxy_healthcheck(
+    State(state): State<Arc<AppState>>,
+    Path((provider_name, name)): Path<(String, String)>,
+    Query(params): Query<DelayParams>,
+) -> Response {
+    let timeout = match parse_delay_params(&params) {
+        Ok(t) => t,
+        Err(resp) => return *resp,
+    };
+    let url = params.url.as_deref().unwrap_or("").to_string();
+    let expected = params.expected.clone();
+
+    let Some(proxy) = find_provider_proxy(&state, &provider_name, &name) else {
+        return msg_err(StatusCode::NOT_FOUND, "resource not found");
+    };
+
+    match probe_and_record(&proxy, &url, expected.as_deref(), timeout).await {
+        Ok(delay) => Json(DelayResp { delay }).into_response(),
+        Err(meow_proxy::health::UrlTestError::Timeout) => {
+            msg_err(StatusCode::GATEWAY_TIMEOUT, "Timeout")
+        }
+        Err(meow_proxy::health::UrlTestError::Transport(_)) => msg_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "An error occurred in the delay test",
+        ),
+    }
 }
 
 // ── Rule Providers ────────────────────────────────────────────────────

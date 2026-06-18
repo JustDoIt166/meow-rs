@@ -105,6 +105,31 @@ pub struct ListenerConfig {
 pub struct ApiConfig {
     pub external_controller: Option<SocketAddr>,
     pub secret: Option<String>,
+    pub ui: UiConfig,
+}
+
+pub const DEFAULT_EXTERNAL_UI_URL: &str =
+    "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiConfig {
+    pub external: Option<ExternalUiConfig>,
+}
+
+impl UiConfig {
+    pub fn built_in() -> Self {
+        Self { external: None }
+    }
+
+    pub fn is_external(&self) -> bool {
+        self.external.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalUiConfig {
+    pub path: PathBuf,
+    pub url: String,
 }
 
 pub async fn load_config(path: &str) -> Result<Config, anyhow::Error> {
@@ -200,6 +225,7 @@ fn rebuild_from_raw_impl(
     shared_ctx: Option<&meow_rules::ParserContext>,
 ) -> Result<RebuildResult, anyhow::Error> {
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
+    let mut global_members = vec!["DIRECT".to_string(), "REJECT".to_string()];
     // Built-in proxies
     let mut direct = meow_proxy::DirectAdapter::new();
     if let Some(mark) = raw.routing_mark {
@@ -238,6 +264,7 @@ fn rebuild_from_raw_impl(
                     .and_then(|v| v.as_str())
                     .unwrap_or_else(|| proxy.name())
                     .into();
+                global_members.push(key.to_string());
                 proxies.insert(key, proxy);
             }
             Err(e) => warn!("Failed to parse proxy: {}", e),
@@ -247,6 +274,10 @@ fn rebuild_from_raw_impl(
     // Multi-pass group resolution: groups can reference other groups.
     // Keep trying until no new groups are resolved.
     let raw_groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
+    let has_global_group = raw_groups.iter().any(|group| group.name == "GLOBAL");
+    for raw_group in raw_groups {
+        global_members.push(raw_group.name.clone());
+    }
     let mut remaining: Vec<&raw::RawProxyGroup> = raw_groups.iter().collect();
     let mut max_passes = remaining.len() + 1;
     while !remaining.is_empty() && max_passes > 0 {
@@ -290,6 +321,20 @@ fn rebuild_from_raw_impl(
             break;
         }
         remaining = still_remaining;
+    }
+
+    if !has_global_group && !proxies.contains_key("GLOBAL") {
+        let members: Vec<Arc<dyn Proxy>> = global_members
+            .iter()
+            .filter_map(|name| proxies.get(name.as_str()).cloned())
+            .collect();
+        if !members.is_empty() {
+            let mut group = meow_proxy::SelectorGroup::new("GLOBAL", members);
+            if let Some(store) = selector_store {
+                group = group.with_store(Arc::clone(store));
+            }
+            proxies.insert(SmolStr::new_static("GLOBAL"), Arc::new(group));
+        }
     }
 
     let owned_ctx;
@@ -801,6 +846,89 @@ fn resource_cache_dir_for_config_path_with_home(path: &str, home_dir: Option<Pat
         )
 }
 
+fn parse_ui_config(raw: &raw::RawConfig) -> Result<UiConfig, anyhow::Error> {
+    let external_ui = raw.external_ui.as_deref().filter(|s| !s.trim().is_empty());
+    let external_ui_name = raw
+        .external_ui_name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty());
+
+    if external_ui.is_none() && external_ui_name.is_none() {
+        return Ok(UiConfig::built_in());
+    }
+
+    let base = meow_config_dir();
+    let path = match (external_ui, external_ui_name) {
+        (Some(ui), Some(name)) => {
+            validate_external_ui_name(name)?;
+            resolve_external_ui_path(ui).join(name)
+        }
+        (Some(ui), None) => resolve_external_ui_path(ui),
+        (None, Some(name)) => {
+            validate_external_ui_name(name)?;
+            base.join("ui").join(name)
+        }
+        (None, None) => unreachable!(),
+    };
+
+    let url = raw
+        .external_ui_url
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(DEFAULT_EXTERNAL_UI_URL)
+        .to_string();
+
+    Ok(UiConfig {
+        external: Some(ExternalUiConfig { path, url }),
+    })
+}
+
+fn resolve_external_ui_path(path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        meow_config_dir().join(path)
+    }
+}
+
+fn validate_external_ui_name(name: &str) -> Result<(), anyhow::Error> {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        anyhow::bail!("external-ui-name must be a relative local path, got absolute path: {name}");
+    }
+
+    let mut saw_component = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) if !part.is_empty() => {
+                saw_component = true;
+            }
+            std::path::Component::CurDir => {
+                anyhow::bail!("external-ui-name must not contain empty or '.' path components");
+            }
+            std::path::Component::ParentDir => {
+                anyhow::bail!("external-ui-name must not contain '..': {name}");
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                anyhow::bail!("external-ui-name must not contain a path prefix or root: {name}");
+            }
+            std::path::Component::Normal(_) => {
+                anyhow::bail!("external-ui-name contains an empty path component: {name}");
+            }
+        }
+    }
+
+    if !saw_component || name.contains('/') && name.split('/').any(str::is_empty) {
+        anyhow::bail!("external-ui-name must not be empty or contain empty path components");
+    }
+    if name.contains('\\') && name.split('\\').any(str::is_empty) {
+        anyhow::bail!("external-ui-name must not contain empty path components");
+    }
+
+    Ok(())
+}
+
 /// Parse `type:` string from a `listeners:` entry into `ListenerType`.
 /// Hard errors on unknown types (Class A per ADR-0002).
 fn parse_listener_type(s: &str) -> Result<ListenerType, anyhow::Error> {
@@ -1053,12 +1181,14 @@ async fn build_config(
     };
 
     // API config
+    let ui = parse_ui_config(&raw)?;
     let api = ApiConfig {
         external_controller: raw
             .external_controller
             .as_deref()
             .and_then(|s| s.parse().ok()),
         secret: raw.secret.clone(),
+        ui,
     };
 
     // Sniffer config — also handles deprecated `tproxy_sni` alias.
@@ -1321,6 +1451,64 @@ rule-providers:
         let got = super::resource_cache_dir_for_config_path_with_home("config.yaml", None);
         assert_eq!(got, super::default_config_dir_without_home_override());
         assert_ne!(got, PathBuf::from("."));
+    }
+
+    #[test]
+    fn ui_config_defaults_to_built_in() {
+        let raw = raw::RawConfig::default();
+        let ui = super::parse_ui_config(&raw).unwrap();
+        assert!(!ui.is_external());
+    }
+
+    #[test]
+    fn external_ui_relative_path_resolves_under_meow_config_dir() {
+        let raw = raw::RawConfig {
+            external_ui: Some("dashboard".to_string()),
+            external_ui_url: Some("https://example.invalid/ui.zip".to_string()),
+            ..Default::default()
+        };
+        let ui = super::parse_ui_config(&raw).unwrap();
+        let external = ui.external.unwrap();
+        assert_eq!(external.path, super::meow_config_dir().join("dashboard"));
+        assert_eq!(external.url, "https://example.invalid/ui.zip");
+    }
+
+    #[test]
+    fn external_ui_name_uses_default_ui_parent_and_default_url() {
+        let raw = raw::RawConfig {
+            external_ui_name: Some("zashboard".to_string()),
+            ..Default::default()
+        };
+        let ui = super::parse_ui_config(&raw).unwrap();
+        let external = ui.external.unwrap();
+        assert_eq!(
+            external.path,
+            super::meow_config_dir().join("ui").join("zashboard")
+        );
+        assert_eq!(external.url, super::DEFAULT_EXTERNAL_UI_URL);
+    }
+
+    #[test]
+    fn invalid_external_ui_name_is_rejected() {
+        for name in ["../evil", "evil/../x", "/abs", "nested//empty"] {
+            let raw = raw::RawConfig {
+                external_ui_name: Some(name.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                super::parse_ui_config(&raw).is_err(),
+                "external-ui-name {name:?} must be rejected"
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            let raw = raw::RawConfig {
+                external_ui_name: Some("C:evil".to_string()),
+                ..Default::default()
+            };
+            assert!(super::parse_ui_config(&raw).is_err());
+        }
     }
 
     #[test]

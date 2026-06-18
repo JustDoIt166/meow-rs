@@ -110,6 +110,9 @@ pub fn match_rules<'rules>(
     let scan_end = trie_hit.unwrap_or(rules.len());
 
     for rule in &rules[..scan_end] {
+        if rule.is_disabled() {
+            continue;
+        }
         if let Some(adapter_name) = rule.match_and_resolve(metadata, &helper) {
             return Some(MatchResult {
                 adapter_name,
@@ -122,15 +125,20 @@ pub fn match_rules<'rules>(
     // Return trie hit if it beat the linear scan.
     if let Some(trie_idx) = trie_hit {
         let rule = &rules[trie_idx];
-        return Some(MatchResult {
-            adapter_name: rule.adapter(),
-            rule_type: rule.rule_type(),
-            rule_payload: rule.payload(),
-        });
+        if !rule.is_disabled() {
+            return Some(MatchResult {
+                adapter_name: rule.adapter(),
+                rule_type: rule.rule_type(),
+                rule_payload: rule.payload(),
+            });
+        }
     }
 
     // No match in [0..T]; continue scanning the remainder (trie miss path).
     for rule in &rules[scan_end..] {
+        if rule.is_disabled() {
+            continue;
+        }
         if let Some(adapter_name) = rule.match_and_resolve(metadata, &helper) {
             return Some(MatchResult {
                 adapter_name,

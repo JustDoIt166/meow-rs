@@ -23,7 +23,7 @@ pub use home_dir::{meow_home_dir, set_home_dir};
 pub use metadata::{AddrDisplay, Metadata};
 pub use network::Network;
 pub use process_lookup::{find_process, ProcessInfo};
-pub use rule::{Rule, RuleMatchHelper, RuleType};
+pub use rule::{Rule, RuleMatchHelper, RuleType, RuntimeRule};
 pub use sniffer::SnifferConfig;
 pub use socket_protect::{bind_udp, connect_tcp, connect_tcp_host, resolve_host, resolve_host_all};
 // Host-resolver hook is cross-platform (iOS installs it without a protector).
