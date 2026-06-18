@@ -79,7 +79,10 @@ impl Hy2Options {
             server_name: self.sni.unwrap_or_default(),
             auth: self.password,
             insecure: self.skip_cert_verify,
-            rx_bps: self.down_bps,
+            bandwidth: crate::hysteria2::BandwidthConfig {
+                recv_bps: self.down_bps,
+                send_bps: self.up_bps,
+            },
             obfs_password,
             hop_ports: self.ports.unwrap_or_default(),
             hop_interval_min_secs: hop_interval.min_secs,
@@ -434,6 +437,20 @@ mod tests {
         assert_eq!(adapter.name(), "hy2");
         assert_eq!(adapter.addr(), "127.0.0.1:443");
         assert!(adapter.support_udp());
+    }
+
+    #[test]
+    fn hysteria_config_preserves_up_and_down_bandwidth() {
+        let (_, _, cfg) = Hy2Options {
+            up_bps: 30_000_000,
+            down_bps: 100_000_000,
+            ..base_options()
+        }
+        .into_hysteria_config()
+        .unwrap();
+
+        assert_eq!(cfg.bandwidth.send_bps, 30_000_000);
+        assert_eq!(cfg.bandwidth.recv_bps, 100_000_000);
     }
 
     #[test]

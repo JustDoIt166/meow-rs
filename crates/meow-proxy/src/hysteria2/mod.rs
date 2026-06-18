@@ -8,7 +8,7 @@ mod tls;
 mod udp;
 
 pub use client::ReconnectableClient;
-pub use config::Config;
+pub use config::{BandwidthConfig, Config};
 pub use error::{Error, Result};
 pub use tcp::DuplexStream;
 pub use udp::UdpSession;

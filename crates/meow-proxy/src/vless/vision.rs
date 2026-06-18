@@ -111,10 +111,10 @@ impl VisionConn {
         if pending.end_padding_after_drain {
             self.write_padding = false;
             if pending.command == COMMAND_PADDING_DIRECT {
-                if !self.enable_inner_raw_write_passthrough() {
+                if let Err(e) = self.enable_inner_raw_write_passthrough() {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::Unsupported,
-                        "vision: DIRECT requested but transport cannot switch to raw passthrough",
+                        format!("vision: DIRECT requested but {e}"),
                     )));
                 }
                 tracing::debug!("XTLS Vision direct write passthrough enabled");
@@ -183,11 +183,15 @@ impl VisionConn {
         true
     }
 
-    fn enable_inner_raw_read_passthrough(&mut self) -> bool {
+    fn enable_inner_raw_read_passthrough(
+        &mut self,
+    ) -> std::result::Result<(), meow_transport::RawPassthroughError> {
         self.inner.enable_raw_read_passthrough()
     }
 
-    fn enable_inner_raw_write_passthrough(&mut self) -> bool {
+    fn enable_inner_raw_write_passthrough(
+        &mut self,
+    ) -> std::result::Result<(), meow_transport::RawPassthroughError> {
         self.inner.enable_raw_write_passthrough()
     }
 
@@ -508,10 +512,10 @@ impl AsyncRead for VisionConn {
                         },
                         COMMAND_PADDING_END => ReadState::Through,
                         COMMAND_PADDING_DIRECT => {
-                            if !self.enable_inner_raw_read_passthrough() {
+                            if let Err(e) = self.enable_inner_raw_read_passthrough() {
                                 return Poll::Ready(Err(io::Error::new(
                                     io::ErrorKind::Unsupported,
-                                    "vision: DIRECT requested but transport cannot switch to raw passthrough",
+                                    format!("vision: DIRECT requested but {e}"),
                                 )));
                             }
                             tracing::debug!("XTLS Vision direct passthrough enabled");

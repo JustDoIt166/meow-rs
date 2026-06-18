@@ -1,4 +1,4 @@
-use super::config::Config;
+use super::config::{Config, NegotiatedBandwidth, ServerRecvRate};
 use super::socket::Hy2UdpSocket;
 use super::tcp::{self, DuplexStream};
 use super::tls;
@@ -76,6 +76,7 @@ pub(crate) struct ClientConnection {
     h3_driver: tokio::task::JoinHandle<()>,
     udp_driver: Option<tokio::task::JoinHandle<()>>,
     pub(crate) udp_enabled: bool,
+    pub(crate) _bandwidth: NegotiatedBandwidth,
     pub(crate) udp_router: Arc<UdpRouter>,
     pub(crate) next_session_id: std::sync::atomic::AtomicU32,
     pub(crate) next_packet_id: AtomicU16,
@@ -176,42 +177,51 @@ async fn connect_addr(
         pending::<()>().await;
     });
 
-    let udp_enabled = match authenticate(&cfg, &mut send_request).await {
-        Ok(udp_enabled) => udp_enabled,
+    let auth = match authenticate(&cfg, &mut send_request).await {
+        Ok(auth) => auth,
         Err(e) => {
             connection.close(0u32.into(), b"auth failed");
             h3_driver.abort();
             return Err(e);
         }
     };
+    let bandwidth = cfg.bandwidth.negotiate(auth.server_recv);
 
     let udp_router = Arc::new(UdpRouter::new());
-    let udp_driver =
-        udp_enabled.then(|| udp::spawn_receiver(connection.clone(), Arc::clone(&udp_router)));
+    let udp_driver = auth
+        .udp_enabled
+        .then(|| udp::spawn_receiver(connection.clone(), Arc::clone(&udp_router)));
 
     Ok(ClientConnection {
         connection,
         _endpoint: endpoint,
         h3_driver,
         udp_driver,
-        udp_enabled,
+        udp_enabled: auth.udp_enabled,
+        _bandwidth: bandwidth,
         udp_router,
         next_session_id: std::sync::atomic::AtomicU32::new(0),
         next_packet_id: AtomicU16::new(0),
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthOutcome {
+    udp_enabled: bool,
+    server_recv: ServerRecvRate,
+}
+
 async fn authenticate(
     cfg: &Config,
     send_request: &mut SendRequest<OpenStreams, bytes::Bytes>,
-) -> Result<bool> {
+) -> Result<AuthOutcome> {
     let padding = super::proto::auth_request_padding();
     let request = http::Request::builder()
         .method(http::Method::POST)
         .uri("https://hysteria/auth")
         .header(http::header::HOST, "hysteria")
         .header("Hysteria-Auth", cfg.auth.as_str())
-        .header("Hysteria-CC-RX", cfg.rx_bps.to_string())
+        .header("Hysteria-CC-RX", cfg.bandwidth.recv_bps.to_string())
         .header("Hysteria-Padding", padding)
         .body(())
         .map_err(|e| Error::Http3(format!("auth request build: {e}")))?;
@@ -243,6 +253,7 @@ async fn authenticate(
         .is_some_and(|value| {
             value.eq_ignore_ascii_case("true") || value == "1" || value.eq_ignore_ascii_case("yes")
         });
+    let server_recv = parse_server_recv_rate(response.headers().get("Hysteria-CC-RX"))?;
 
     while let Some(mut chunk) = stream
         .recv_data()
@@ -252,7 +263,31 @@ async fn authenticate(
         chunk.advance(chunk.remaining());
     }
 
-    Ok(udp_enabled)
+    Ok(AuthOutcome {
+        udp_enabled,
+        server_recv,
+    })
+}
+
+fn parse_server_recv_rate(value: Option<&http::HeaderValue>) -> Result<ServerRecvRate> {
+    let Some(value) = value else {
+        return Ok(ServerRecvRate::Missing);
+    };
+    let value = value
+        .to_str()
+        .map_err(|e| Error::protocol(format!("invalid Hysteria-CC-RX header: {e}")))?
+        .trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(ServerRecvRate::Auto);
+    }
+    let bps = value
+        .parse::<u64>()
+        .map_err(|e| Error::protocol(format!("invalid Hysteria-CC-RX value '{value}': {e}")))?;
+    if bps == 0 {
+        Ok(ServerRecvRate::Unlimited)
+    } else {
+        Ok(ServerRecvRate::Limited(bps))
+    }
 }
 
 struct ServerTarget {
@@ -294,6 +329,7 @@ impl ServerTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderValue;
 
     #[test]
     fn parses_domain_server_target() {
@@ -307,5 +343,31 @@ mod tests {
         let target = ServerTarget::parse("[::1]:443").unwrap();
         assert_eq!(target.host, "::1");
         assert_eq!(target.port, 443);
+    }
+
+    #[test]
+    fn parses_server_recv_rate_header() {
+        assert_eq!(
+            parse_server_recv_rate(None).unwrap(),
+            ServerRecvRate::Missing
+        );
+        assert_eq!(
+            parse_server_recv_rate(Some(&HeaderValue::from_static("auto"))).unwrap(),
+            ServerRecvRate::Auto
+        );
+        assert_eq!(
+            parse_server_recv_rate(Some(&HeaderValue::from_static("0"))).unwrap(),
+            ServerRecvRate::Unlimited
+        );
+        assert_eq!(
+            parse_server_recv_rate(Some(&HeaderValue::from_static("12345"))).unwrap(),
+            ServerRecvRate::Limited(12345)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_server_recv_rate_header() {
+        let err = parse_server_recv_rate(Some(&HeaderValue::from_static("fast"))).unwrap_err();
+        assert!(err.to_string().contains("invalid Hysteria-CC-RX value"));
     }
 }

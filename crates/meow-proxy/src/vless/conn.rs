@@ -58,12 +58,16 @@ impl VlessConn {
         })
     }
 
-    pub(crate) fn enable_raw_read_passthrough(&mut self) -> bool {
-        meow_transport::enable_raw_read_passthrough(&mut *self.inner)
+    pub(crate) fn enable_raw_read_passthrough(
+        &mut self,
+    ) -> std::result::Result<(), meow_transport::RawPassthroughError> {
+        meow_transport::try_enable_raw_read_passthrough(&mut *self.inner)
     }
 
-    pub(crate) fn enable_raw_write_passthrough(&mut self) -> bool {
-        meow_transport::enable_raw_write_passthrough(&mut *self.inner)
+    pub(crate) fn enable_raw_write_passthrough(
+        &mut self,
+    ) -> std::result::Result<(), meow_transport::RawPassthroughError> {
+        meow_transport::try_enable_raw_write_passthrough(&mut *self.inner)
     }
 }
 
