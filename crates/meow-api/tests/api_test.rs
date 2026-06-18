@@ -3,7 +3,9 @@ use dashmap::DashMap;
 use http_body_util::BodyExt;
 use meow_api::routes::{create_router, AppState};
 use meow_common::DnsMode;
-use meow_config::raw::{RawConfig, RawProxyGroup, RawProxyProvider, RawSubscription};
+use meow_config::raw::{
+    RawConfig, RawHealthCheck, RawProxyGroup, RawProxyProvider, RawSubscription,
+};
 use meow_dns::Resolver;
 use meow_trie::DomainTrie;
 use meow_tunnel::Tunnel;
@@ -344,6 +346,73 @@ async fn get_proxy_global_returns_compat_group_for_dashboard() {
 }
 
 #[tokio::test]
+async fn get_group_lists_only_proxy_groups() {
+    let mut raw = test_raw_config();
+    raw.proxy_groups = Some(vec![RawProxyGroup {
+        name: "Sel".into(),
+        group_type: "select".into(),
+        proxies: Some(vec!["DIRECT".into(), "REJECT".into()]),
+        ..Default::default()
+    }]);
+    let state = test_state(raw);
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/group")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let groups = json["proxies"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert!(groups.iter().any(|g| g["name"] == "Sel"));
+    assert!(groups.iter().any(|g| g["name"] == "GLOBAL"));
+}
+
+#[tokio::test]
+async fn get_group_detail_rejects_non_group() {
+    let state = test_state_default();
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/group/DIRECT")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn get_group_detail_returns_group_info() {
+    let mut raw = test_raw_config();
+    raw.proxy_groups = Some(vec![RawProxyGroup {
+        name: "Sel".into(),
+        group_type: "select".into(),
+        proxies: Some(vec!["DIRECT".into(), "REJECT".into()]),
+        ..Default::default()
+    }]);
+    let state = test_state(raw);
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/group/Sel")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["name"], "Sel");
+    assert_eq!(json["all"], serde_json::json!(["DIRECT", "REJECT"]));
+}
+
+#[tokio::test]
 async fn get_proxies_includes_provider_members_as_top_level_entries() {
     let state = test_state_default();
     let dir = tempfile::tempdir().unwrap();
@@ -429,6 +498,47 @@ async fn get_proxy_finds_provider_member() {
 }
 
 #[tokio::test]
+async fn get_provider_proxy_detail() {
+    let state = test_state_default();
+    let dir = tempfile::tempdir().unwrap();
+    let provider_path = dir.path().join("provider.yaml");
+    std::fs::write(
+        &provider_path,
+        "proxies:\n  - name: provider-a\n    type: http\n    server: 127.0.0.1\n    port: 8080\n",
+    )
+    .unwrap();
+    let raw_provider = RawProxyProvider {
+        provider_type: "file".to_string(),
+        url: None,
+        path: Some(provider_path.to_string_lossy().to_string()),
+        interval: None,
+        filter: None,
+        exclude_filter: None,
+        exclude_type: None,
+        health_check: None,
+        header: None,
+    };
+    let provider = Arc::new(
+        meow_config::proxy_provider::ProxyProvider::new("sub", &raw_provider, None).unwrap(),
+    );
+    provider.refresh().await;
+    state.proxy_providers.insert("sub".to_string(), provider);
+
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/providers/proxies/sub/provider-a")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["name"], "provider-a");
+}
+
+#[tokio::test]
 async fn get_proxy_not_found() {
     let state = test_state_default();
     let app = create_router(state);
@@ -475,6 +585,68 @@ async fn get_configs_returns_mode() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["mode"], "rule");
+}
+
+#[tokio::test]
+async fn get_configs_returns_external_controller_compat_fields() {
+    let mut raw = test_raw_config();
+    raw.port = Some(7891);
+    raw.socks_port = Some(7892);
+    raw.mixed_port = Some(7893);
+    raw.redir_port = Some(7894);
+    raw.tproxy_port = Some(7895);
+    raw.allow_lan = Some(true);
+    raw.bind_address = Some("127.0.0.1".into());
+    raw.log_level = Some("debug".into());
+    raw.ipv6 = Some(true);
+    raw.unified_delay = Some(true);
+    raw.tcp_concurrent = Some(true);
+    raw.tcp_fack = Some(true);
+    raw.geodata_mode = Some(serde_yaml::Value::Bool(true));
+    raw.geodata_loader = Some(serde_yaml::Value::String("standard".into()));
+    raw.geo_auto_update = Some(true);
+    raw.geo_update_interval = Some(12);
+    raw.external_controller = Some("127.0.0.1:9090".into());
+    raw.secret = Some("sec".into());
+    raw.external_ui_name = Some("metacubexd".into());
+    raw.external_ui_url = Some("https://example.invalid/ui.zip".into());
+    raw.sniffer = Some(meow_config::raw::RawSniffer {
+        enable: Some(true),
+        ..Default::default()
+    });
+    let state = test_state(raw);
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            Request::get("/configs")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["port"], 7891);
+    assert_eq!(json["socks-port"], 7892);
+    assert_eq!(json["mixed-port"], 7893);
+    assert_eq!(json["redir-port"], 7894);
+    assert_eq!(json["tproxy-port"], 7895);
+    assert_eq!(json["allow-lan"], true);
+    assert_eq!(json["bind-address"], "127.0.0.1");
+    assert_eq!(json["log-level"], "debug");
+    assert_eq!(json["ipv6"], true);
+    assert_eq!(json["sniffing"], true);
+    assert_eq!(json["tcp-concurrent"], true);
+    assert_eq!(json["geodata-mode"], true);
+    assert_eq!(json["geodata-loader"], "standard");
+    assert_eq!(json["geo-auto-update"], true);
+    assert_eq!(json["geo-update-interval"], 12);
+    assert_eq!(json["external-controller"], "127.0.0.1:9090");
+    assert_eq!(json["secret"], "sec");
+    assert_eq!(json["unified-delay"], true);
+    assert_eq!(json["tcp-fack"], true);
+    assert_eq!(json["external-ui-name"], "metacubexd");
+    assert_eq!(json["external-ui-url"], "https://example.invalid/ui.zip");
 }
 
 #[tokio::test]
@@ -657,6 +829,70 @@ async fn get_rules_returns_initial() {
     assert_eq!(rules[0]["payload"], "example.com");
     assert_eq!(rules[0]["proxy"], "DIRECT");
     assert_eq!(rules[1]["type"], "MATCH");
+}
+
+#[tokio::test]
+async fn patch_rules_disable_toggles_rule_and_matching() {
+    let state = test_state_default();
+    let app = create_router(Arc::clone(&state));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/rules")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"0":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let app = create_router(Arc::clone(&state));
+    let resp = app
+        .oneshot(
+            Request::get("/rules")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["rules"][0]["extra"]["disabled"], true);
+
+    let mut metadata = meow_common::Metadata {
+        host: "example.com".into(),
+        dst_port: 443,
+        ..Default::default()
+    };
+    let (_, rule_type, _) = state
+        .tunnel
+        .inner()
+        .resolve_proxy(&metadata)
+        .expect("rule mode should resolve a proxy");
+    assert_eq!(rule_type.as_str(), "MATCH");
+
+    let app = create_router(Arc::clone(&state));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/rules/disable")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"0":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    metadata.host = "example.com".into();
+    let (_, rule_type, _) = state
+        .tunnel
+        .inner()
+        .resolve_proxy(&metadata)
+        .expect("rule mode should resolve a proxy");
+    assert_eq!(rule_type.as_str(), "DOMAIN");
 }
 
 #[tokio::test]
@@ -1935,6 +2171,90 @@ async fn a1_get_proxy_delay_ok_records_delay() {
     let proxies = &route.proxies;
     let proxy = proxies.get("T").unwrap();
     assert_eq!(proxy.delay_history().len(), 1);
+}
+
+#[tokio::test]
+async fn provider_proxy_healthcheck_uses_provider_member() {
+    let proxy = TestAdapter::new(
+        "provider-a",
+        DialBehavior::SleepThenOk(std::time::Duration::from_millis(5)),
+    )
+    .into_proxy();
+    let state = state_with_proxies(vec![]);
+    let dir = tempfile::tempdir().unwrap();
+    let provider_path = dir.path().join("provider.yaml");
+    std::fs::write(&provider_path, "proxies: []\n").unwrap();
+    let raw_provider = RawProxyProvider {
+        provider_type: "file".to_string(),
+        url: None,
+        path: Some(provider_path.to_string_lossy().to_string()),
+        interval: None,
+        filter: None,
+        exclude_filter: None,
+        exclude_type: None,
+        health_check: None,
+        header: None,
+    };
+    let provider = Arc::new(
+        meow_config::proxy_provider::ProxyProvider::new("sub", &raw_provider, None).unwrap(),
+    );
+    provider.slot.write().push(Arc::clone(&proxy));
+    state.proxy_providers.insert("sub".to_string(), provider);
+
+    let app = create_router(Arc::clone(&state));
+    let resp = delay_req(
+        app,
+        format!(
+            "/providers/proxies/sub/provider-a/healthcheck?url={}&timeout=1000",
+            url_q()
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(body["delay"].as_u64().unwrap() > 0);
+    assert_eq!(proxy.delay_history().len(), 1);
+}
+
+#[tokio::test]
+async fn provider_healthcheck_without_query_matches_mihomo() {
+    let proxy = TestAdapter::new(
+        "provider-a",
+        DialBehavior::SleepThenOk(std::time::Duration::from_millis(5)),
+    )
+    .into_proxy();
+    let state = state_with_proxies(vec![]);
+    let dir = tempfile::tempdir().unwrap();
+    let provider_path = dir.path().join("provider.yaml");
+    std::fs::write(&provider_path, "proxies: []\n").unwrap();
+    let raw_provider = RawProxyProvider {
+        provider_type: "file".to_string(),
+        url: None,
+        path: Some(provider_path.to_string_lossy().to_string()),
+        interval: None,
+        filter: None,
+        exclude_filter: None,
+        exclude_type: None,
+        health_check: Some(RawHealthCheck {
+            enable: Some(true),
+            url: Some("http://example.com/generate_204".to_string()),
+            interval: Some(300),
+            timeout: Some(1000),
+            lazy: None,
+        }),
+        header: None,
+    };
+    let provider = Arc::new(
+        meow_config::proxy_provider::ProxyProvider::new("sub", &raw_provider, None).unwrap(),
+    );
+    provider.slot.write().push(proxy);
+    state.proxy_providers.insert("sub".to_string(), provider);
+
+    let app = create_router(state);
+    let resp = delay_req(app, "/providers/proxies/sub/healthcheck".to_string()).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(bytes.is_empty());
 }
 
 // ── B: single-proxy error surface ────────────────────────────────────

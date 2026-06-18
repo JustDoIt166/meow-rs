@@ -1950,17 +1950,41 @@ async fn provider_healthcheck(
     Path(name): Path<String>,
     Query(params): Query<DelayParams>,
 ) -> Response {
+    let provider = match state.proxy_providers.get(&name) {
+        Some(entry) => Arc::clone(entry.value()),
+        None => return msg_err(StatusCode::NOT_FOUND, "resource not found"),
+    };
+
+    // Upstream mihomo's provider healthcheck endpoint does not require query
+    // params; it triggers the provider's configured health-check and returns
+    // 204. Keep the explicit url+timeout form as a meow-rs extension for
+    // callers that want immediate per-proxy delay results.
+    if params.url.is_none() && params.timeout.is_none() && params.expected.is_none() {
+        let Some(health_check) = provider.health_check.as_ref() else {
+            return StatusCode::NO_CONTENT.into_response();
+        };
+        let url = health_check.url.clone();
+        let timeout = Duration::from_millis(health_check.timeout);
+        let members = provider.proxies();
+        tokio::spawn(async move {
+            let mut set: JoinSet<()> = JoinSet::new();
+            for proxy in members {
+                let url = url.clone();
+                set.spawn(async move {
+                    let _ = probe_and_record(&proxy, &url, None, timeout).await;
+                });
+            }
+            while set.join_next().await.is_some() {}
+        });
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
     let timeout = match parse_delay_params(&params) {
         Ok(t) => t,
         Err(resp) => return *resp,
     };
     let url = params.url.as_deref().unwrap_or("").to_string();
     let expected = params.expected.clone();
-
-    let provider = match state.proxy_providers.get(&name) {
-        Some(entry) => Arc::clone(entry.value()),
-        None => return msg_err(StatusCode::NOT_FOUND, "resource not found"),
-    };
 
     let members = provider.proxies();
     let url_shared = Arc::new(url);
