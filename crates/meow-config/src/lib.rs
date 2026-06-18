@@ -122,15 +122,8 @@ pub async fn load_config(path: &str) -> Result<Config, anyhow::Error> {
         )
     })?;
     let raw: raw::RawConfig = parse_raw_yaml(content)?;
-    // Rule-provider cache files live next to config.yaml.
-    let cache_dir: Option<PathBuf> = std::path::Path::new(path).parent().and_then(|p| {
-        if p.as_os_str().is_empty() {
-            None
-        } else {
-            Some(p.to_path_buf())
-        }
-    });
-    build_config(raw, cache_dir.as_deref()).await
+    let cache_dir = resource_cache_dir_for_config_path(path);
+    build_config(raw, Some(cache_dir.as_path())).await
 }
 
 pub async fn load_config_from_str(content: &str) -> Result<Config, anyhow::Error> {
@@ -584,7 +577,14 @@ fn build_parser_context_at(
 
     let asn_trigger = lines.iter().find(|l| line_is_asn_rule(l));
     let asn = match asn_trigger {
-        Some(trigger) => Some(Arc::new(load_mmdb(asn_path, "GeoLite2-ASN", trigger)?)),
+        Some(trigger) => {
+            let reader = load_mmdb_mmap(asn_path, "GeoLite2-ASN", trigger)?;
+            let allowed = collect_asn_numbers(lines);
+            let index = meow_rules::asn_index::AsnIndex::build(&reader, &allowed)
+                .map_err(|e| anyhow::anyhow!("failed to build ASN index: {e}"))?;
+            drop(reader);
+            Some(Arc::new(index))
+        }
         None => None,
     };
 
@@ -606,33 +606,6 @@ fn build_parser_context_at(
         geosite,
         ..Default::default()
     })
-}
-
-fn load_mmdb(
-    path: &Path,
-    kind: &str,
-    trigger: &str,
-) -> Result<maxminddb::Reader<Vec<u8>>, anyhow::Error> {
-    let bytes = std::fs::read(path).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to load {} database at {}\n  required by rule: {}\n  underlying error: {}",
-            kind,
-            path.display(),
-            trigger.trim(),
-            e
-        )
-    })?;
-    let reader = maxminddb::Reader::from_source(bytes).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse {} database at {}\n  required by rule: {}\n  underlying error: {}",
-            kind,
-            path.display(),
-            trigger.trim(),
-            e
-        )
-    })?;
-    info!("Loaded {} database from {}", kind, path.display());
-    Ok(reader)
 }
 
 /// Memory-map an MMDB file. The OS reclaims pages immediately on drop,
@@ -711,6 +684,30 @@ fn collect_geosite_categories(lines: &[String]) -> std::collections::HashSet<Str
     out
 }
 
+/// Scan raw rule lines and return the ASN numbers referenced by `IP-ASN,` /
+/// `SRC-IP-ASN,` payloads, including occurrences inside logic rules.
+fn collect_asn_numbers(lines: &[String]) -> std::collections::HashSet<u32> {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:SRC-)?IP-ASN\s*,\s*(\d+)").expect("compile IP-ASN scan regex")
+    });
+    let mut out = std::collections::HashSet::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        for cap in re.captures_iter(line) {
+            if let Ok(asn) = cap[1].parse::<u32>() {
+                out.insert(asn);
+            }
+        }
+    }
+    out
+}
+
 /// True iff `line` (a raw `rules:` entry) reads the GeoIP Country database.
 /// Covers `GEOIP` and `SRC-GEOIP` — both share the same MMDB reader.
 fn line_is_geoip_rule(line: &str) -> bool {
@@ -776,11 +773,32 @@ pub fn meow_config_dir() -> PathBuf {
     if let Some(d) = meow_common::meow_home_dir() {
         return d;
     }
+    default_config_dir_without_home_override()
+}
+
+fn default_config_dir_without_home_override() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("meow")
+}
+
+fn resource_cache_dir_for_config_path(path: &str) -> PathBuf {
+    resource_cache_dir_for_config_path_with_home(path, meow_common::meow_home_dir())
+}
+
+fn resource_cache_dir_for_config_path_with_home(path: &str, home_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(dir) = home_dir {
+        return dir;
+    }
+    std::path::Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(
+            default_config_dir_without_home_override,
+            std::path::Path::to_path_buf,
+        )
 }
 
 /// Parse `type:` string from a `listeners:` entry into `ListenerType`.
@@ -1280,6 +1298,29 @@ rule-providers:
         assert_eq!(cn.format.as_deref(), Some("mrs"));
         assert_eq!(cn.interval, Some(86400));
         assert_eq!(cn.url.as_deref(), Some("https://example.invalid/cn.mrs"));
+    }
+
+    #[test]
+    fn provider_cache_dir_prefers_home_override() {
+        let home = PathBuf::from("/tmp/meow-home");
+        let got = super::resource_cache_dir_for_config_path_with_home(
+            "/elsewhere/config.yaml",
+            Some(home.clone()),
+        );
+        assert_eq!(got, home);
+    }
+
+    #[test]
+    fn provider_cache_dir_uses_config_parent_without_home_override() {
+        let got = super::resource_cache_dir_for_config_path_with_home("/tmp/cfg/config.yaml", None);
+        assert_eq!(got, PathBuf::from("/tmp/cfg"));
+    }
+
+    #[test]
+    fn provider_cache_dir_does_not_fall_back_to_cwd_for_bare_config_name() {
+        let got = super::resource_cache_dir_for_config_path_with_home("config.yaml", None);
+        assert_eq!(got, super::default_config_dir_without_home_override());
+        assert_ne!(got, PathBuf::from("."));
     }
 
     #[test]
