@@ -576,7 +576,7 @@ async fn ensure_geodata(raw: &raw::RawConfig, geo: &GeoDataConfig) {
 fn build_parser_context_from_raw(
     raw: &raw::RawConfig,
 ) -> Result<meow_rules::ParserContext, anyhow::Error> {
-    let geo = geodata::parse_geodata(raw.geodata.as_ref())?;
+    let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
     build_parser_context_with_geo(raw, &geo)
 }
 
@@ -1066,8 +1066,9 @@ async fn build_config(
     }
 
     // Geodata config — parse and validate early so path errors surface before
-    // anything tries to load the DBs.
-    let geodata = geodata::parse_geodata(raw.geodata.as_ref())?;
+    // anything tries to load the DBs. `geox-url:` (top-level, Go-aligned) is
+    // the sole source for download URL overrides.
+    let geodata = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
 
     // General config
     let mode = raw

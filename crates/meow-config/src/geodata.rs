@@ -1,5 +1,5 @@
 use crate::internal_http;
-use crate::raw::RawGeoDataConfig;
+use crate::raw::{RawGeoDataConfig, RawGeoXUrl};
 use anyhow::anyhow;
 use meow_common::adapter::Proxy;
 use std::path::{Path, PathBuf};
@@ -7,14 +7,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
+/// Default download URLs, aligned with Go mihomo v1.19.27.
 const DEFAULT_MMDB_URL: &str =
-    "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/country.mmdb";
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb";
 const DEFAULT_ASN_URL: &str =
-    "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb";
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb";
 const DEFAULT_GEOSITE_URL: &str =
-    "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geosite.dat";
+    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat";
 
-/// Validated `geodata:` config, produced by [`parse_geodata`].
+/// Validated geodata config, produced by [`parse_geodata`].
 #[derive(Debug, Clone)]
 pub struct GeoDataConfig {
     pub mmdb_path: Option<PathBuf>,
@@ -23,6 +24,10 @@ pub struct GeoDataConfig {
     pub auto_update: bool,
     /// Hours between update checks (≥1).
     pub auto_update_interval: u32,
+    /// URL for binary GeoIP database (`geoip.dat`). Aligned with Go's
+    /// `geox-url.geoip`. Not used by meow-rs (MMDB-only), but accepted for
+    /// upstream-config compatibility.
+    pub geo_ip_url: Option<String>,
     pub mmdb_url: String,
     pub asn_url: String,
     pub geosite_url: String,
@@ -36,6 +41,7 @@ impl Default for GeoDataConfig {
             geosite_path: None,
             auto_update: false,
             auto_update_interval: 24,
+            geo_ip_url: None,
             mmdb_url: DEFAULT_MMDB_URL.to_string(),
             asn_url: DEFAULT_ASN_URL.to_string(),
             geosite_url: DEFAULT_GEOSITE_URL.to_string(),
@@ -43,11 +49,32 @@ impl Default for GeoDataConfig {
     }
 }
 
-/// Parse and validate the raw `geodata:` block. Returns `GeoDataConfig::default()`
-/// when the block is absent.
-pub fn parse_geodata(raw: Option<&RawGeoDataConfig>) -> Result<GeoDataConfig, anyhow::Error> {
+/// Resolve a download URL: `geox-url:<key>` if set, else `default`.
+fn resolve_url(geox_val: Option<&str>, default: &str) -> String {
+    geox_val.unwrap_or(default).to_string()
+}
+
+/// Parse and validate geodata config from `geodata:` and `geox-url:` blocks.
+///
+/// Download URLs use the top-level `geox-url:` block if present,
+/// falling back to built-in defaults aligned with Go v1.19.27.
+///
+/// Returns `GeoDataConfig::default()` when both blocks are absent.
+pub fn parse_geodata(
+    raw: Option<&RawGeoDataConfig>,
+    geox_url: Option<&RawGeoXUrl>,
+) -> Result<GeoDataConfig, anyhow::Error> {
+    let default_geox = RawGeoXUrl::default();
+    let gx = geox_url.unwrap_or(&default_geox);
+
     let Some(r) = raw else {
-        return Ok(GeoDataConfig::default());
+        return Ok(GeoDataConfig {
+            geo_ip_url: gx.geo_ip.clone(),
+            mmdb_url: gx.mmdb.clone().unwrap_or_else(|| DEFAULT_MMDB_URL.to_string()),
+            asn_url: gx.asn.clone().unwrap_or_else(|| DEFAULT_ASN_URL.to_string()),
+            geosite_url: gx.geosite.clone().unwrap_or_else(|| DEFAULT_GEOSITE_URL.to_string()),
+            ..GeoDataConfig::default()
+        });
     };
 
     // Warn on upstream-only fields (Class B per ADR-0002 §geodata-subsection.md).
@@ -72,22 +99,16 @@ pub fn parse_geodata(raw: Option<&RawGeoDataConfig>) -> Result<GeoDataConfig, an
         ));
     }
 
-    let urls = r.url.as_ref();
     Ok(GeoDataConfig {
         mmdb_path: r.mmdb_path.as_deref().map(PathBuf::from),
         asn_path: r.asn_path.as_deref().map(PathBuf::from),
         geosite_path: r.geosite_path.as_deref().map(PathBuf::from),
         auto_update: r.auto_update,
         auto_update_interval: interval,
-        mmdb_url: urls
-            .and_then(|u| u.mmdb.clone())
-            .unwrap_or_else(|| DEFAULT_MMDB_URL.to_string()),
-        asn_url: urls
-            .and_then(|u| u.asn.clone())
-            .unwrap_or_else(|| DEFAULT_ASN_URL.to_string()),
-        geosite_url: urls
-            .and_then(|u| u.geosite.clone())
-            .unwrap_or_else(|| DEFAULT_GEOSITE_URL.to_string()),
+        geo_ip_url: gx.geo_ip.clone(),
+        mmdb_url: resolve_url(gx.mmdb.as_deref(), DEFAULT_MMDB_URL),
+        asn_url: resolve_url(gx.asn.as_deref(), DEFAULT_ASN_URL),
+        geosite_url: resolve_url(gx.geosite.as_deref(), DEFAULT_GEOSITE_URL),
     })
 }
 
@@ -158,7 +179,7 @@ pub async fn download_and_replace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raw::{RawGeoDataConfig, RawGeoDataUrls};
+    use crate::raw::{RawGeoDataConfig, RawGeoXUrl};
 
     fn raw_defaults() -> RawGeoDataConfig {
         RawGeoDataConfig::default()
@@ -166,13 +187,14 @@ mod tests {
 
     #[test]
     fn absent_block_returns_defaults() {
-        let cfg = parse_geodata(None).unwrap();
+        let cfg = parse_geodata(None, None).unwrap();
         assert!(!cfg.auto_update);
         assert_eq!(cfg.auto_update_interval, 24);
         assert!(cfg.mmdb_path.is_none());
         assert!(cfg.asn_path.is_none());
         assert!(cfg.geosite_path.is_none());
-        assert!(cfg.mmdb_url.contains("country.mmdb"));
+        assert!(cfg.geo_ip_url.is_none());
+        assert!(cfg.mmdb_url.contains("geoip.metadb"));
         assert!(cfg.asn_url.contains("GeoLite2-ASN"));
         assert!(cfg.geosite_url.contains("geosite.dat"));
     }
@@ -185,7 +207,7 @@ mod tests {
             geosite_path: Some("/custom/geosite.mrs".to_string()),
             ..raw_defaults()
         };
-        let cfg = parse_geodata(Some(&raw)).unwrap();
+        let cfg = parse_geodata(Some(&raw), None).unwrap();
         assert_eq!(
             cfg.mmdb_path.unwrap().to_str().unwrap(),
             "/custom/Country.mmdb"
@@ -198,17 +220,14 @@ mod tests {
     }
 
     #[test]
-    fn url_overrides_replace_defaults() {
-        let raw = RawGeoDataConfig {
-            url: Some(RawGeoDataUrls {
-                mmdb: Some("https://example.com/country.mmdb".to_string()),
-                asn: None,
-                geosite: Some("https://example.com/geosite.mrs".to_string()),
-            }),
-            ..raw_defaults()
+    fn geox_url_overrides_defaults() {
+        let gx = RawGeoXUrl {
+            mmdb: Some("https://example.com/geoip.metadb".to_string()),
+            geosite: Some("https://example.com/geosite.mrs".to_string()),
+            ..Default::default()
         };
-        let cfg = parse_geodata(Some(&raw)).unwrap();
-        assert_eq!(cfg.mmdb_url, "https://example.com/country.mmdb");
+        let cfg = parse_geodata(None, Some(&gx)).unwrap();
+        assert_eq!(cfg.mmdb_url, "https://example.com/geoip.metadb");
         assert!(cfg.asn_url.contains("GeoLite2-ASN")); // default preserved
         assert_eq!(cfg.geosite_url, "https://example.com/geosite.mrs");
     }
@@ -219,7 +238,7 @@ mod tests {
             auto_update_interval: Some(0),
             ..raw_defaults()
         };
-        let err = parse_geodata(Some(&raw)).unwrap_err();
+        let err = parse_geodata(Some(&raw), None).unwrap_err();
         assert!(
             err.to_string().contains("at least 1 hour"),
             "error should mention minimum interval: {err}"
@@ -233,7 +252,7 @@ mod tests {
             auto_update_interval: None,
             ..raw_defaults()
         };
-        let cfg = parse_geodata(Some(&raw)).unwrap();
+        let cfg = parse_geodata(Some(&raw), None).unwrap();
         assert_eq!(cfg.auto_update_interval, 24);
     }
 
@@ -247,6 +266,30 @@ mod tests {
             ..raw_defaults()
         };
         // Must not error — warn-only (Class B per ADR-0002).
-        parse_geodata(Some(&raw)).unwrap();
+        parse_geodata(Some(&raw), None).unwrap();
+    }
+
+    #[test]
+    fn geox_url_alone_provides_defaults() {
+        // When geodata block is absent but geox-url is present.
+        let gx = RawGeoXUrl {
+            mmdb: Some("https://custom/mmdb".to_string()),
+            ..Default::default()
+        };
+        let cfg = parse_geodata(None, Some(&gx)).unwrap();
+        assert_eq!(cfg.mmdb_url, "https://custom/mmdb");
+        assert!(cfg.asn_url.contains("GeoLite2-ASN")); // default
+        assert!(cfg.geosite_url.contains("geosite.dat")); // default
+        assert!(cfg.geo_ip_url.is_none());
+    }
+
+    #[test]
+    fn geox_url_geoip_field_stored() {
+        let gx = RawGeoXUrl {
+            geo_ip: Some("https://example/geoip.dat".to_string()),
+            ..Default::default()
+        };
+        let cfg = parse_geodata(None, Some(&gx)).unwrap();
+        assert_eq!(cfg.geo_ip_url.as_deref(), Some("https://example/geoip.dat"));
     }
 }

@@ -41,7 +41,29 @@ where
     deserializer.deserialize_any(StringOrSeq)
 }
 
-/// `geodata:` YAML subsection — path overrides, download URLs, auto-update.
+/// Top-level `geox-url:` block — aligns with Go mihomo v1.19.27.
+///
+/// Overrides download URLs for GeoIP databases. When set, these values take
+/// priority over built-in defaults.
+///
+/// | Field      | Go yaml tag | Description                              |
+/// |------------|-------------|------------------------------------------|
+/// | `geoip`    | `geoip`     | Binary GeoIP database (`geoip.dat`)      |
+/// | `mmdb`     | `mmdb`      | MMDB GeoIP database (`geoip.metadb`)     |
+/// | `asn`      | `asn`       | ASN database (`GeoLite2-ASN.mmdb`)       |
+/// | `geosite`  | `geosite`   | Geosite domain database (`geosite.dat`)  |
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct RawGeoXUrl {
+    #[serde(rename = "geoip")]
+    pub geo_ip: Option<String>,
+    pub mmdb: Option<String>,
+    pub asn: Option<String>,
+    pub geosite: Option<String>,
+}
+
+/// `geodata:` YAML subsection — path overrides, auto-update.
+///
+/// Download URLs are now configured via the top-level `geox-url:` block.
 ///
 /// Fields `geodata-mode`, `geodata-loader`, and `geoip-matcher` exist in
 /// upstream Go mihomo but are not meaningful here. They are accepted and
@@ -61,21 +83,10 @@ pub struct RawGeoDataConfig {
     /// Hours between update checks. Minimum 1 (sub-hour polling hammers CDN
     /// rate limits). Hard parse error on 0.
     pub auto_update_interval: Option<u32>,
-    /// Download URL overrides. Defaults baked in when absent.
-    pub url: Option<RawGeoDataUrls>,
     // Upstream-only fields accepted for forward-compat; we warn-once and ignore.
     pub geodata_mode: Option<serde_yaml::Value>,
     pub geodata_loader: Option<serde_yaml::Value>,
     pub geoip_matcher: Option<serde_yaml::Value>,
-}
-
-/// `geodata.url.*` — download URL overrides.
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "kebab-case")]
-pub struct RawGeoDataUrls {
-    pub mmdb: Option<String>,
-    pub asn: Option<String>,
-    pub geosite: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -125,6 +136,9 @@ pub struct RawConfig {
     pub listeners: Option<Vec<RawListener>>,
     pub authentication: Option<Vec<String>>,
     pub skip_auth_prefixes: Option<Vec<String>>,
+    /// Top-level `geox-url:` block aligning with Go mihomo.
+    /// Overrides built-in download URL defaults.
+    pub geox_url: Option<RawGeoXUrl>,
     pub geodata: Option<RawGeoDataConfig>,
     /// Global default cap on concurrent in-flight inbound connections per
     /// listener. `0` (the default) disables the cap. Individual `listeners:`
